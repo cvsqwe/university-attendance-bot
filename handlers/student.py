@@ -20,7 +20,7 @@ from magic_filter import F
 import config
 import panel
 from database import Database
-from keyboards import back_to_menu_kb, main_menu_kb, with_back_to_menu
+from keyboards import back_to_menu_kb, employee_menu_kb, main_menu_kb, with_back_to_menu
 from maxapi.filters import Command, CommandObject, CommandStart
 from maxapi.router import Router
 from maxapi.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -32,6 +32,8 @@ from utils import (
     today_msk,
     weekday_ru_for,
 )
+
+from .employee import EMPLOYEE_TOKEN_PREFIX, render_employee_menu
 
 router = Router(name="student")
 
@@ -51,7 +53,14 @@ NEEDS_INVITE_TEXT = (
 
 async def render_main_menu(target: PanelTarget, db: Database, state: FSMContext) -> None:
     student = await db.get_student_by_max_user_id(target.from_user.id)
-    await panel.show(target, state, "🏠 <b>Главное меню</b>", main_menu_kb(bool(student and student.is_staff)))
+    if student:
+        await panel.show(target, state, "🏠 <b>Главное меню</b>", main_menu_kb(student.is_staff))
+        return
+    employee = await db.get_employee_by_max_user_id(target.from_user.id)
+    if employee:
+        await render_employee_menu(target, db, state)
+        return
+    await panel.show(target, state, NEEDS_INVITE_TEXT)
 
 
 @router.callback_query(F.data == "menu:home")
@@ -89,8 +98,28 @@ async def cmd_start(message: Message, command: CommandObject, db: Database, stat
         )
         return
 
+    employee = await db.get_employee_by_max_user_id(message.from_user.id)
+    if employee:
+        await render_employee_menu(message, db, state)
+        return
+
     token = command.args
     if token:
+        if token.startswith(EMPLOYEE_TOKEN_PREFIX):
+            plain_token = token[len(EMPLOYEE_TOKEN_PREFIX):]
+            bound_employee = await db.register_employee_by_token(
+                plain_token, message.from_user.id, message.from_user.name
+            )
+            if bound_employee:
+                await panel.show(
+                    message, state,
+                    "✅ Готово! Вам открыт доступ сотрудника к отчётам по посещаемости.",
+                    employee_menu_kb(),
+                )
+                return
+            await panel.show(message, state, "Ссылка недействительна или устарела. Обратитесь к старосте за новой.")
+            return
+
         bound = await db.register_student_by_token(token, message.from_user.id)
         if bound:
             role_label = ROLE_LABELS[bound.role]
@@ -120,6 +149,10 @@ async def cmd_register(message: Message, db: Database, state: FSMContext) -> Non
         await panel.show(
             message, state, f"Вы уже зарегистрированы как {student.full_name}.", main_menu_kb(student.is_staff)
         )
+        return
+    employee = await db.get_employee_by_max_user_id(message.from_user.id)
+    if employee:
+        await panel.show(message, state, "У вас уже есть доступ сотрудника к отчётам.", employee_menu_kb())
         return
     await panel.show(message, state, NEEDS_INVITE_TEXT)
 
@@ -408,6 +441,16 @@ async def cb_noop(callback: CallbackQuery) -> None:
 # ----------------------------------------------------------------------
 async def _render_help(target: PanelTarget, db: Database, state: FSMContext) -> None:
     student = await db.get_student_by_max_user_id(target.from_user.id)
+    if student is None:
+        employee = await db.get_employee_by_max_user_id(target.from_user.id)
+        if employee:
+            await panel.show(
+                target, state,
+                "<b>Меню сотрудника</b>\nВыгрузка Excel-отчётов по посещаемости: за конкретную пару, "
+                "день, неделю, месяц или за всё время.",
+                employee_menu_kb(),
+            )
+            return
     lines = [
         "<b>Меню бота</b>",
         "📅 Сегодня — расписание и статус на сегодня",

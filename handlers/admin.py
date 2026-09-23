@@ -25,7 +25,15 @@ from maxapi.router import Router
 from maxapi.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from reports import build_excel_report
 from scheduler import AttendanceScheduler
-from utils import ROLE_LABELS, STATUS_LABELS, STATUS_LABELS_SHORT, fmt_date_human, today_msk, weekday_ru_for
+from utils import (
+    MONTHS_RU_GEN,
+    ROLE_LABELS,
+    STATUS_LABELS,
+    STATUS_LABELS_SHORT,
+    fmt_date_human,
+    today_msk,
+    weekday_ru_for,
+)
 
 router = Router(name="admin")
 
@@ -36,17 +44,35 @@ PanelTarget = Message | CallbackQuery
 # Invite links — the only way a new account gets registered. Each roster
 # entry owns a one-time secret token; the starosta/deputy hands out the
 # max.ru deep link built from it, and /start binds automatically.
+#
+# The employee report link (top of this screen) is different: it's a
+# single reusable token, not tied to any name — anyone who follows it
+# gets employee (report-only) access. See handlers/employee.py.
 # ----------------------------------------------------------------------
-async def _invite_list_view(db: Database) -> tuple[str, InlineKeyboardMarkup]:
+async def _invite_list_view(db: Database, bot: MaxClient) -> tuple[str, InlineKeyboardMarkup]:
+    me = await bot.get_me()
+    employee_token = await db.get_or_create_employee_invite_token()
+    employee_link = f"https://max.ru/{me.username}?start=staff-{employee_token}"
+
+    lines = [
+        "👔 <b>Ссылка для сотрудников</b> (отчёты, многоразовая):",
+        f"<code>{employee_link}</code>",
+        "",
+    ]
+
     unregistered = await db.get_unregistered_students()
-    if not unregistered:
-        return "🎉 Все участники группы уже зарегистрированы.", back_to_menu_kb()
+    if unregistered:
+        lines.append(f"Не зарегистрированы в группе ({len(unregistered)}):")
+        lines.append("Выберите, чтобы получить персональную ссылку для регистрации.")
+    else:
+        lines.append("🎉 Все участники группы уже зарегистрированы.")
+
     buttons = [
         [InlineKeyboardButton(text=s.full_name, callback_data=f"inv:show:{s.id}")]
         for s in unregistered
     ]
-    text = f"Не зарегистрированы ({len(unregistered)}):\nВыберите, чтобы получить ссылку для регистрации."
-    return text, with_back_to_menu(buttons)
+    buttons.append([InlineKeyboardButton(text="🔄 Перевыпустить ссылку сотрудников", callback_data="emp_link:regen")])
+    return "\n".join(lines), with_back_to_menu(buttons)
 
 
 async def _render_invite_card(callback: CallbackQuery, db: Database, bot: MaxClient, state: FSMContext,
@@ -73,27 +99,36 @@ async def _render_invite_card(callback: CallbackQuery, db: Database, bot: MaxCli
 
 
 @router.message(Command("invites"))
-async def cmd_invites(message: Message, db: Database, state: FSMContext) -> None:
+async def cmd_invites(message: Message, db: Database, bot: MaxClient, state: FSMContext) -> None:
     if await _require_staff(message, db) is None:
         return
-    text, kb = await _invite_list_view(db)
+    text, kb = await _invite_list_view(db, bot)
     await panel.show(message, state, text, kb)
 
 
 @router.callback_query(F.data == "menu:invites")
-async def cb_menu_invites(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+async def cb_menu_invites(callback: CallbackQuery, db: Database, bot: MaxClient, state: FSMContext) -> None:
     if await _require_staff_cb(callback, db) is None:
         return
-    text, kb = await _invite_list_view(db)
+    text, kb = await _invite_list_view(db, bot)
     await panel.show(callback, state, text, kb)
 
 
 @router.callback_query(F.data == "inv:back")
-async def cb_invites_back(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+async def cb_invites_back(callback: CallbackQuery, db: Database, bot: MaxClient, state: FSMContext) -> None:
     if await _require_staff_cb(callback, db) is None:
         return
-    text, kb = await _invite_list_view(db)
+    text, kb = await _invite_list_view(db, bot)
     await panel.show(callback, state, text, kb)
+
+
+@router.callback_query(F.data == "emp_link:regen")
+async def cb_employee_link_regen(callback: CallbackQuery, db: Database, bot: MaxClient, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    await db.regenerate_employee_invite_token()
+    text, kb = await _invite_list_view(db, bot)
+    await panel.show(callback, state, text, kb, toast="Ссылка сотрудников перевыпущена")
 
 
 @router.callback_query(F.data.startswith("inv:show:"))
@@ -415,10 +450,6 @@ async def cb_override_set(callback: CallbackQuery, db: Database, state: FSMConte
 # /report — Excel export (build_excel_report lives in reports.py, shared
 # with the automatic weekly report in scheduler.py)
 # ----------------------------------------------------------------------
-MONTHS_RU_GEN: dict[int, str] = {
-    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель", 5: "Май", 6: "Июнь",
-    7: "Июль", 8: "Август", 9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
-}
 
 
 def _report_period_keyboard() -> InlineKeyboardMarkup:

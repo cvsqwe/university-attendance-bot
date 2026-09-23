@@ -86,6 +86,22 @@ CREATE TABLE IF NOT EXISTS planned_absences (
     created_at TEXT NOT NULL,
     UNIQUE(student_id, date)
 );
+
+-- "Employees": report-only viewers (e.g. deanery staff) who aren't on the
+-- student roster at all and don't get a personal invite link — instead
+-- everyone shares one reusable token (see employee_invite below).
+CREATE TABLE IF NOT EXISTS employees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    max_user_id INTEGER UNIQUE NOT NULL,
+    display_name TEXT,
+    registered_at TEXT NOT NULL
+);
+
+-- Single-row table holding the current reusable employee invite token.
+CREATE TABLE IF NOT EXISTS employee_invite (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    token TEXT NOT NULL
+);
 """
 
 
@@ -111,6 +127,23 @@ def _row_to_student(row: aiosqlite.Row) -> Student:
         max_user_id=row["max_user_id"],
         registered_at=row["registered_at"],
         invite_token=row["invite_token"],
+    )
+
+
+@dataclass
+class Employee:
+    id: int
+    max_user_id: int
+    display_name: str | None
+    registered_at: str
+
+
+def _row_to_employee(row: aiosqlite.Row) -> Employee:
+    return Employee(
+        id=row["id"],
+        max_user_id=row["max_user_id"],
+        display_name=row["display_name"],
+        registered_at=row["registered_at"],
     )
 
 
@@ -611,3 +644,82 @@ class Database:
                 (date,),
             )
             return await cur.fetchall()
+
+    # ------------------------------------------------------------------
+    # Employees — report-only access via one reusable invite link, not
+    # tied to the student roster (see the `employees`/`employee_invite`
+    # tables above).
+    # ------------------------------------------------------------------
+    async def get_employee_by_max_user_id(self, max_user_id: int) -> Employee | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM employees WHERE max_user_id = ?", (max_user_id,))
+            row = await cur.fetchone()
+            return _row_to_employee(row) if row else None
+
+    async def get_or_create_employee_invite_token(self) -> str:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT token FROM employee_invite WHERE id = 1")
+            row = await cur.fetchone()
+            if row:
+                return row["token"]
+            token = secrets.token_urlsafe(8)
+            await db.execute("INSERT INTO employee_invite (id, token) VALUES (1, ?)", (token,))
+            await db.commit()
+            return token
+
+    async def regenerate_employee_invite_token(self) -> str:
+        token = secrets.token_urlsafe(8)
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO employee_invite (id, token) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET token = excluded.token",
+                (token,),
+            )
+            await db.commit()
+        return token
+
+    async def register_employee_by_token(self, token: str, max_user_id: int,
+                                          display_name: str | None) -> Employee | None:
+        """The invite token is reusable (one link for everyone), so unlike
+        student registration this never invalidates it — it only rejects a
+        wrong/stale token. Re-registering the same max_user_id is a no-op
+        that just returns the existing row."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT token FROM employee_invite WHERE id = 1")
+            row = await cur.fetchone()
+            if row is None or row["token"] != token:
+                return None
+
+            cur = await db.execute("SELECT * FROM employees WHERE max_user_id = ?", (max_user_id,))
+            existing = await cur.fetchone()
+            if existing:
+                return _row_to_employee(existing)
+
+            await db.execute(
+                "INSERT INTO employees (max_user_id, display_name, registered_at) VALUES (?, ?, ?)",
+                (max_user_id, display_name, dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            await db.commit()
+            cur = await db.execute("SELECT * FROM employees WHERE max_user_id = ?", (max_user_id,))
+            return _row_to_employee(await cur.fetchone())
+
+    # ------------------------------------------------------------------
+    # Report date pickers (employee report menu)
+    # ------------------------------------------------------------------
+    async def get_distinct_session_dates(self, limit: int = 40) -> list[str]:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT DISTINCT date FROM sessions ORDER BY date DESC LIMIT ?", (limit,)
+            )
+            return [row[0] for row in await cur.fetchall()]
+
+    async def get_session_date_bounds(self) -> tuple[str, str] | None:
+        async with self._connect() as db:
+            cur = await db.execute("SELECT MIN(date), MAX(date) FROM sessions")
+            row = await cur.fetchone()
+            if row is None or row[0] is None:
+                return None
+            return row[0], row[1]

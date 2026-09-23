@@ -29,8 +29,19 @@ def main_menu_kb(is_staff: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗂 Карточка студента", callback_data="menu:card"),
             InlineKeyboardButton(text="📝➕ Групповой пропуск", callback_data="menu:bulk_excuse"),
         ])
+        rows.append([InlineKeyboardButton(text="👔 Меню сотрудника", callback_data="menu:employee_view")])
     rows.append([InlineKeyboardButton(text="❓ Помощь", callback_data="menu:help")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def employee_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Отчёт за пару", callback_data="emp:pair_day")],
+        [InlineKeyboardButton(text="🗓 Отчёт за день", callback_data="emp:day")],
+        [InlineKeyboardButton(text="📆 Отчёт за неделю", callback_data="emp:week")],
+        [InlineKeyboardButton(text="🈷 Отчёт за месяц", callback_data="emp:month")],
+        [InlineKeyboardButton(text="📚 Отчёт за всё время", callback_data="emp:all")],
+    ])
 
 
 def back_to_menu_kb() -> InlineKeyboardMarkup:
