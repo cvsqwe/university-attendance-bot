@@ -1,4 +1,4 @@
-from aiogram import Router
+from maxapi.router import Router
 
 from .admin import router as admin_router
 from .schedule import router as schedule_router

@@ -13,22 +13,17 @@ from __future__ import annotations
 
 import datetime as dt
 
-from aiogram import F, Router
-from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    ReplyKeyboardRemove,
-)
+from magic_filter import F
 
 import config
 import panel
 from database import Database
 from keyboards import back_to_menu_kb, main_menu_kb, with_back_to_menu
+from maxapi.filters import Command, CommandObject, CommandStart
+from maxapi.router import Router
+from maxapi.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from utils import (
     ROLE_LABELS,
     STATUS_LABELS,
@@ -55,7 +50,7 @@ NEEDS_INVITE_TEXT = (
 
 
 async def render_main_menu(target: PanelTarget, db: Database, state: FSMContext) -> None:
-    student = await db.get_student_by_telegram_id(target.from_user.id)
+    student = await db.get_student_by_max_user_id(target.from_user.id)
     await panel.show(target, state, "🏠 <b>Главное меню</b>", main_menu_kb(bool(student and student.is_staff)))
 
 
@@ -75,15 +70,7 @@ async def cb_menu_home(callback: CallbackQuery, db: Database, state: FSMContext)
 # ----------------------------------------------------------------------
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, db: Database, state: FSMContext) -> None:
-    # One-time, invisible cleanup of the old bottom reply-keyboard for chats
-    # that saw it before the panel redesign — harmless no-op otherwise.
-    try:
-        ping = await message.answer("·", reply_markup=ReplyKeyboardRemove())
-        await ping.delete()
-    except Exception:
-        pass
-
-    student = await db.get_student_by_telegram_id(message.from_user.id)
+    student = await db.get_student_by_max_user_id(message.from_user.id)
     if student:
         role_label = ROLE_LABELS[student.role]
         await panel.show(
@@ -107,7 +94,7 @@ async def cmd_start(message: Message, command: CommandObject, db: Database, stat
             )
             return
         owner = await db.get_student_by_invite_token(token)
-        if owner is not None and owner.telegram_id is not None:
+        if owner is not None and owner.max_user_id is not None:
             await panel.show(
                 message, state,
                 "Эта пригласительная ссылка уже была использована.\n"
@@ -120,7 +107,7 @@ async def cmd_start(message: Message, command: CommandObject, db: Database, stat
 
 @router.message(Command("register"))
 async def cmd_register(message: Message, db: Database, state: FSMContext) -> None:
-    student = await db.get_student_by_telegram_id(message.from_user.id)
+    student = await db.get_student_by_max_user_id(message.from_user.id)
     if student:
         await panel.show(
             message, state, f"Вы уже зарегистрированы как {student.full_name}.", main_menu_kb(student.is_staff)
@@ -133,7 +120,7 @@ async def cmd_register(message: Message, db: Database, state: FSMContext) -> Non
 # /today — today's schedule and this student's attendance status
 # ----------------------------------------------------------------------
 async def _render_today(target: PanelTarget, db: Database, state: FSMContext) -> None:
-    student = await db.get_student_by_telegram_id(target.from_user.id)
+    student = await db.get_student_by_max_user_id(target.from_user.id)
     if student is None:
         await panel.show(target, state, NEEDS_INVITE_TEXT)
         return
@@ -229,7 +216,7 @@ def _absence_reason_keyboard() -> InlineKeyboardMarkup:
 
 
 async def _render_absence_start(target: PanelTarget, db: Database, state: FSMContext) -> None:
-    student = await db.get_student_by_telegram_id(target.from_user.id)
+    student = await db.get_student_by_max_user_id(target.from_user.id)
     if student is None:
         await panel.show(target, state, NEEDS_INVITE_TEXT)
         return
@@ -255,7 +242,7 @@ async def cb_absence_back_days(callback: CallbackQuery, state: FSMContext) -> No
 
 @router.callback_query(F.data.startswith("absence_day:"))
 async def cb_absence_day(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
-    student = await db.get_student_by_telegram_id(callback.from_user.id)
+    student = await db.get_student_by_max_user_id(callback.from_user.id)
     if student is None:
         await callback.answer("Вы не зарегистрированы.", show_alert=True)
         return
@@ -270,7 +257,7 @@ async def cb_absence_day(callback: CallbackQuery, db: Database, state: FSMContex
 
 @router.callback_query(AbsenceStates.choosing_reason, F.data.startswith("absence_reason:"))
 async def cb_absence_reason_chip(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
-    student = await db.get_student_by_telegram_id(callback.from_user.id)
+    student = await db.get_student_by_max_user_id(callback.from_user.id)
     data = await state.get_data()
     date_iso = data.get("absence_date")
     if student is None or date_iso is None:
@@ -304,7 +291,7 @@ async def cb_absence_reason_custom(callback: CallbackQuery, state: FSMContext) -
 
 @router.message(AbsenceStates.waiting_custom_reason)
 async def msg_absence_custom_reason(message: Message, db: Database, state: FSMContext) -> None:
-    student = await db.get_student_by_telegram_id(message.from_user.id)
+    student = await db.get_student_by_max_user_id(message.from_user.id)
     data = await state.get_data()
     date_iso = data.get("absence_date")
     if student is None or date_iso is None:
@@ -331,7 +318,7 @@ async def msg_absence_custom_reason(message: Message, db: Database, state: FSMCo
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("checkin:"))
 async def cb_checkin(callback: CallbackQuery, db: Database) -> None:
-    student = await db.get_student_by_telegram_id(callback.from_user.id)
+    student = await db.get_student_by_max_user_id(callback.from_user.id)
     if student is None:
         await callback.answer("Вы не зарегистрированы. Используйте /start.", show_alert=True)
         return
@@ -373,7 +360,7 @@ async def cb_noop(callback: CallbackQuery) -> None:
 # /help
 # ----------------------------------------------------------------------
 async def _render_help(target: PanelTarget, db: Database, state: FSMContext) -> None:
-    student = await db.get_student_by_telegram_id(target.from_user.id)
+    student = await db.get_student_by_max_user_id(target.from_user.id)
     lines = [
         "<b>Меню бота</b>",
         "📅 Сегодня — расписание и статус на сегодня",

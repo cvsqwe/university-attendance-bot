@@ -1,6 +1,6 @@
 """
 Bot entry point: wires the database, scheduler and handlers together and
-starts long polling.
+starts long polling against the MAX bot API.
 """
 from __future__ import annotations
 
@@ -8,13 +8,11 @@ import asyncio
 import logging
 import sys
 
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage
-
 import config
 from database import Database
 from handlers import get_root_router
+from maxapi.client import MaxApiError, MaxClient
+from maxapi.dispatcher import dispatch_update
 from scheduler import AttendanceScheduler
 
 logging.basicConfig(
@@ -25,15 +23,11 @@ logger = logging.getLogger("main")
 
 
 async def main() -> None:
-    if not config.BOT_TOKEN:
-        logger.error("BOT_TOKEN is not set. Create a .env file (see .env.example) or export it.")
+    if not config.MAX_BOT_TOKEN:
+        logger.error("MAX_BOT_TOKEN is not set. Create a .env file (see .env.example) or export it.")
         sys.exit(1)
 
-    bot = Bot(
-        token=config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode="HTML"),
-    )
-    dispatcher = Dispatcher(storage=MemoryStorage())
+    bot = MaxClient(token=config.MAX_BOT_TOKEN)
 
     db = Database()
     await db.init_db()
@@ -45,15 +39,30 @@ async def main() -> None:
     sched.start()
     logger.info("Scheduler started")
 
-    dispatcher.include_router(get_root_router())
+    root_router = get_root_router()
+    base_ctx = {"db": db, "sched": sched, "bot": bot}
 
-    await bot.delete_webhook(drop_pending_updates=True)
+    me = await bot.get_me()
+    logger.info("Long polling for bot @%s (id=%s)", me.username, me.id)
 
+    marker: int | None = None
     try:
-        await dispatcher.start_polling(bot, db=db, sched=sched)
+        while True:
+            try:
+                updates, marker = await bot.get_updates(marker=marker, timeout=30)
+            except MaxApiError as exc:
+                logger.warning("get_updates failed: %s — retrying shortly", exc)
+                await asyncio.sleep(5)
+                continue
+
+            for update in updates:
+                try:
+                    await dispatch_update(root_router, update, bot, base_ctx)
+                except Exception:
+                    logger.exception("Unhandled error while dispatching update: %r", update)
     finally:
         sched.scheduler.shutdown(wait=False)
-        await bot.session.close()
+        await bot.close()
 
 
 if __name__ == "__main__":

@@ -5,15 +5,15 @@ which aiogram keeps per (chat, user) regardless of FSM state, so it's
 visible to every handler in every router.
 
 Free-text replies (e.g. typing a custom subject) are deleted right after
-being read — Telegram bots are allowed to delete incoming messages in
-private chats — so a screen that needs typed input doesn't leave a trail
-either.
+being read — bots are allowed to delete incoming messages in private
+chats — so a screen that needs typed input doesn't leave a trail either.
 """
 from __future__ import annotations
 
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+
+from maxapi.client import MaxApiError
+from maxapi.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 PanelTarget = Message | CallbackQuery
 
@@ -24,26 +24,27 @@ async def show(target: PanelTarget, state: FSMContext, text: str,
         try:
             await target.message.edit_text(text, reply_markup=keyboard)
             await state.update_data(panel_message_id=target.message.message_id)
-        except TelegramBadRequest:
+        except MaxApiError:
             pass
-        await (target.answer(toast) if toast else target.answer())
+        try:
+            await (target.answer(toast) if toast else target.answer())
+        except MaxApiError:
+            pass
         return
 
     message = target
     try:
         await message.delete()
-    except TelegramBadRequest:
+    except MaxApiError:
         pass
 
     data = await state.get_data()
     panel_id = data.get("panel_message_id")
     if panel_id:
         try:
-            await message.bot.edit_message_text(
-                text, chat_id=message.chat.id, message_id=panel_id, reply_markup=keyboard
-            )
+            await message.bot.edit_message(panel_id, text, keyboard=keyboard)
             return
-        except TelegramBadRequest:
+        except MaxApiError:
             pass  # panel message gone or too old — fall through to sending a new one
 
     sent = await message.answer(text, reply_markup=keyboard)

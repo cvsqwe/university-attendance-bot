@@ -11,16 +11,15 @@ from zoneinfo import ZoneInfo
 
 import os
 
-from aiogram import Bot
-from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 import config
 from database import Database
-from reports import build_excel_report
+from maxapi.client import MaxApiError, MaxClient
+from maxapi.types import InlineKeyboardButton, InlineKeyboardMarkup
+from reports import build_excel_report, build_session_excel_report
 from utils import aware, combine_dt, fmt_date_human, fmt_dt, now_msk, parse_dt
 
 logger = logging.getLogger(__name__)
@@ -35,7 +34,7 @@ _aware = aware
 
 
 class AttendanceScheduler:
-    def __init__(self, bot: Bot, db: Database):
+    def __init__(self, bot: MaxClient, db: Database):
         self.bot = bot
         self.db = db
         self.scheduler = AsyncIOScheduler(timezone=TZ)
@@ -73,6 +72,7 @@ class AttendanceScheduler:
             )
         logger.info("Configured %d weekly notification jobs", len(entries))
         await self._configure_weekly_report_job()
+        await self._configure_unregistered_reminder_job()
 
     async def _configure_weekly_report_job(self) -> None:
         """(Re)schedules the automatic weekly report to fire right after
@@ -120,15 +120,30 @@ class AttendanceScheduler:
                 continue
             if close_dt <= now:
                 await self._close_job(row["id"])
-            else:
-                self.scheduler.add_job(
-                    self._close_job,
-                    trigger=DateTrigger(run_date=_aware(close_dt)),
-                    id=f"close_{row['id']}",
-                    args=[row["id"]],
-                    replace_existing=True,
-                    misfire_grace_time=3600,
-                )
+                continue
+
+            if row["reminded"] == 0:
+                reminder_dt = close_dt - dt.timedelta(minutes=config.REMINDER_BEFORE_CLOSE_MIN)
+                if reminder_dt <= now:
+                    await self._reminder_job(row["id"])
+                else:
+                    self.scheduler.add_job(
+                        self._reminder_job,
+                        trigger=DateTrigger(run_date=_aware(reminder_dt)),
+                        id=f"remind_{row['id']}",
+                        args=[row["id"]],
+                        replace_existing=True,
+                        misfire_grace_time=300,
+                    )
+
+            self.scheduler.add_job(
+                self._close_job,
+                trigger=DateTrigger(run_date=_aware(close_dt)),
+                id=f"close_{row['id']}",
+                args=[row["id"]],
+                replace_existing=True,
+                misfire_grace_time=3600,
+            )
 
         today = now.date()
         today_ru = config.WEEKDAY_PY_INDEX_TO_RU[today.weekday()]
@@ -176,6 +191,17 @@ class AttendanceScheduler:
             await self._send_checkin_notifications(session_id, entry, date_iso, start_dt)
             await self.db.mark_session_notified(session_id)
 
+        reminder_dt = close_dt - dt.timedelta(minutes=config.REMINDER_BEFORE_CLOSE_MIN)
+        if reminder_dt > notify_dt:
+            self.scheduler.add_job(
+                self._reminder_job,
+                trigger=DateTrigger(run_date=_aware(reminder_dt)),
+                id=f"remind_{session_id}",
+                args=[session_id],
+                replace_existing=True,
+                misfire_grace_time=300,
+            )
+
         self.scheduler.add_job(
             self._close_job,
             trigger=DateTrigger(run_date=_aware(close_dt)),
@@ -206,11 +232,35 @@ class AttendanceScheduler:
                 [InlineKeyboardButton(text="🟢 Я на паре", callback_data=f"checkin:{session_id}")],
             ])
             try:
-                message = await self.bot.send_message(student.telegram_id, text, reply_markup=keyboard)
-            except (TelegramForbiddenError, TelegramBadRequest) as exc:
+                message = await self.bot.send_message(text, user_id=student.max_user_id, keyboard=keyboard)
+            except MaxApiError as exc:
                 logger.warning("Could not notify student %s: %s", student.full_name, exc)
                 continue
-            await self.db.add_notification(session_id, student.id, student.telegram_id, message.message_id)
+            await self.db.add_notification(session_id, student.id, student.max_user_id, message.message_id)
+
+    # ------------------------------------------------------------------
+    # Reminder job — fires a couple minutes before the check-in window
+    # closes, nudging whoever hasn't tapped "Я на паре" yet.
+    # ------------------------------------------------------------------
+    async def _reminder_job(self, session_id: int) -> None:
+        session = await self.db.get_session(session_id)
+        if session is None or session["closed"] == 1 or session["reminded"] == 1:
+            return
+
+        notifications = await self.db.get_notifications_for_session(session_id)
+        for notif in notifications:
+            attendance = await self.db.get_attendance(session_id, notif["student_id"])
+            if attendance is not None:
+                continue  # already checked in, or excused
+            try:
+                await self.bot.send_message(
+                    "⏰ Через пару минут закроется отметка на паре — не забудьте нажать «🟢 Я на паре».",
+                    user_id=notif["user_id"],
+                )
+            except MaxApiError as exc:
+                logger.warning("Could not send reminder for session %s: %s", session_id, exc)
+
+        await self.db.mark_session_reminded(session_id)
 
     # ------------------------------------------------------------------
     # Close job — fires 10 minutes before class end
@@ -235,12 +285,10 @@ class AttendanceScheduler:
                 # Database.excuse_existing_sessions) — leave it as is,
                 # don't relabel it absent in the summary.
                 try:
-                    await self.bot.edit_message_text(
-                        chat_id=notif["chat_id"],
-                        message_id=notif["message_id"],
-                        text="📝 Оформлен плановый пропуск — отметка не требуется.",
+                    await self.bot.edit_message(
+                        notif["message_id"], "📝 Оформлен плановый пропуск — отметка не требуется."
                     )
-                except (TelegramBadRequest, TelegramForbiddenError):
+                except MaxApiError:
                     pass
                 continue
 
@@ -249,12 +297,8 @@ class AttendanceScheduler:
             if student:
                 absent_names.append(student.full_name)
             try:
-                await self.bot.edit_message_text(
-                    chat_id=notif["chat_id"],
-                    message_id=notif["message_id"],
-                    text="❌ Отметка закрыта (пропуск)",
-                )
-            except (TelegramBadRequest, TelegramForbiddenError):
+                await self.bot.edit_message(notif["message_id"], "❌ Отметка закрыта (пропуск)")
+            except MaxApiError:
                 pass
 
         # Students who never registered can't have been notified or have
@@ -263,7 +307,7 @@ class AttendanceScheduler:
         # registered. Once they register, this stops applying and they go
         # through the normal notify/check-in flow above like everyone else.
         for student in await self.db.get_all_students():
-            if student.telegram_id is not None:
+            if student.max_user_id is not None:
                 continue
             await self.db.mark_attendance(session_id, student.id, "absent")
             absent_names.append(f"{student.full_name} (не зарегистрирован)")
@@ -280,29 +324,29 @@ class AttendanceScheduler:
         if not staff:
             return
 
-        lines = [
-            f"📊 <b>Итоги пары №{session['pair_number']}</b> ({session['subject']})",
-            f"📅 {session['date']}, {session['weekday']}",
-            "",
-            f"✅ Присутствовало: {present_count}",
-            f"❌ Отсутствовало: {len(absent_names)}",
-            f"📝 По уважительной причине: {len(excused_names)}",
-        ]
-        if absent_names:
-            lines.append("")
-            lines.append("<b>Отсутствовали:</b>")
-            lines.extend(f"• {name}" for name in absent_names)
-        if excused_names:
-            lines.append("")
-            lines.append("<b>Уважительная причина:</b>")
-            lines.extend(f"• {name}" for name in excused_names)
+        caption = (
+            f"📊 <b>Итоги пары №{session['pair_number']}</b> ({session['subject']})\n"
+            f"📅 {session['date']}, {session['weekday']}\n\n"
+            f"✅ Присутствовало: {present_count}\n"
+            f"❌ Отсутствовало: {len(absent_names)}\n"
+            f"📝 По уважительной причине: {len(excused_names)}\n\n"
+            "Полный список — в приложенном файле."
+        )
 
-        text = "\n".join(lines)
-        for person in staff:
-            try:
-                await self.bot.send_message(person.telegram_id, text)
-            except (TelegramBadRequest, TelegramForbiddenError) as exc:
-                logger.warning("Could not send report to %s: %s", person.full_name, exc)
+        file_path = await build_session_excel_report(self.db, session)
+        try:
+            for person in staff:
+                try:
+                    await self.bot.send_document(
+                        file_path,
+                        f"Посещаемость_{session['date']}_пара{session['pair_number']}.xlsx",
+                        caption=caption,
+                        user_id=person.max_user_id,
+                    )
+                except MaxApiError as exc:
+                    logger.warning("Could not send report to %s: %s", person.full_name, exc)
+        finally:
+            os.remove(file_path)
 
     # ------------------------------------------------------------------
     # Weekly report — fires right after Saturday's last pair closes
@@ -323,8 +367,8 @@ class AttendanceScheduler:
             text = f"📊 Итоги за неделю {period_label}: занятий не было."
             for person in staff:
                 try:
-                    await self.bot.send_message(person.telegram_id, text)
-                except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                    await self.bot.send_message(text, user_id=person.max_user_id)
+                except MaxApiError as exc:
                     logger.warning("Could not send weekly report to %s: %s", person.full_name, exc)
             return
 
@@ -333,11 +377,50 @@ class AttendanceScheduler:
             for person in staff:
                 try:
                     await self.bot.send_document(
-                        person.telegram_id,
-                        FSInputFile(file_path, filename=f"Посещаемость_{monday.isoformat()}_{saturday.isoformat()}.xlsx"),
+                        file_path,
+                        f"Посещаемость_{monday.isoformat()}_{saturday.isoformat()}.xlsx",
                         caption=f"📊 Итоговый отчёт за неделю {period_label}",
+                        user_id=person.max_user_id,
                     )
-                except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                except MaxApiError as exc:
                     logger.warning("Could not send weekly report to %s: %s", person.full_name, exc)
         finally:
             os.remove(file_path)
+
+    # ------------------------------------------------------------------
+    # Unregistered reminder — weekly nudge to staff listing anyone who
+    # still hasn't followed their invite link.
+    # ------------------------------------------------------------------
+    async def _configure_unregistered_reminder_job(self) -> None:
+        self.scheduler.add_job(
+            self._unregistered_reminder_job,
+            trigger=CronTrigger(
+                day_of_week=config.UNREGISTERED_REMINDER_WEEKDAY_CRON,
+                hour=config.UNREGISTERED_REMINDER_HOUR,
+                minute=config.UNREGISTERED_REMINDER_MINUTE,
+                timezone=TZ,
+            ),
+            id="unregistered_reminder",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
+    async def _unregistered_reminder_job(self) -> None:
+        staff = await self.db.get_staff()
+        if not staff:
+            return
+        unregistered = await self.db.get_unregistered_students()
+        if not unregistered:
+            return
+
+        lines = [f"🔔 <b>Ещё не зарегистрированы в боте</b> ({len(unregistered)}):", ""]
+        lines.extend(f"• {s.full_name}" for s in unregistered)
+        lines.append("")
+        lines.append("Пригласительные ссылки — в «🔗 Ссылки».")
+        text = "\n".join(lines)
+
+        for person in staff:
+            try:
+                await self.bot.send_message(text, user_id=person.max_user_id)
+            except MaxApiError as exc:
+                logger.warning("Could not send unregistered reminder to %s: %s", person.full_name, exc)

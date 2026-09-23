@@ -9,17 +9,19 @@ new messages.
 """
 from __future__ import annotations
 
-from aiogram import F, Router
-from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from magic_filter import F
 
 import config
 import panel
 from access import require_staff, require_staff_cb
 from database import Database
 from keyboards import with_back_to_menu
+from maxapi.client import MaxApiError, MaxClient
+from maxapi.filters import Command
+from maxapi.router import Router
+from maxapi.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from scheduler import AttendanceScheduler
 
 router = Router(name="schedule")
@@ -454,21 +456,53 @@ async def _show_confirm(target: PanelTarget, state: FSMContext) -> None:
     await panel.show(target, state, text, InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
+async def _notify_schedule_change(db: Database, bot: MaxClient, weekday: str, pair_number: int) -> None:
+    """Broadcasts an already-announced pair's new details to every
+    registered student — called only when an existing slot was edited,
+    not when a brand-new one is created."""
+    entry = await db.get_schedule_entry_by_slot(weekday, pair_number)
+    if entry is None:
+        return
+    text = (
+        f"🔔 <b>Изменения в расписании</b>\n\n"
+        f"{config.WEEKDAY_FULL_RU[weekday]}, пара {pair_number} ({entry['start_time']}–{entry['end_time']})\n"
+        f"📚 {entry['subject']} — {entry['class_type']}\n"
+        f"👤 {entry['teacher']}\n"
+        f"🔗 {entry['link']}"
+    )
+    for student in await db.get_all_registered_students():
+        try:
+            await bot.send_message(text, user_id=student.max_user_id)
+        except MaxApiError:
+            pass
+
+
 @router.callback_query(F.data == "sw:save")
-async def cb_sw_save(callback: CallbackQuery, db: Database, state: FSMContext, sched: AttendanceScheduler) -> None:
+async def cb_sw_save(callback: CallbackQuery, db: Database, bot: MaxClient, state: FSMContext,
+                      sched: AttendanceScheduler) -> None:
     if await require_staff_cb(callback, db) is None:
         return
     data = await state.get_data()
+    weekday, pair_number = data["weekday"], data["pair_number"]
+    existing = await db.get_schedule_entry_by_slot(weekday, pair_number)
+    was_change = existing is not None and (
+        existing["class_type"] != data["class_type"]
+        or existing["subject"] != data["subject"]
+        or existing["teacher"] != data["teacher"]
+        or existing["link"] != data["link"]
+    )
+
     await db.upsert_schedule_entry(
-        weekday=data["weekday"],
-        pair_number=data["pair_number"],
+        weekday=weekday,
+        pair_number=pair_number,
         class_type=data["class_type"],
         subject=data["subject"],
         link=data["link"],
         teacher=data["teacher"],
     )
     await sched.configure_weekly_jobs()
-    weekday = data["weekday"]
+    if was_change:
+        await _notify_schedule_change(db, bot, weekday, pair_number)
     await panel.clear_keep_panel(state)
     text, kb = await _day_view(weekday, db)
     await panel.show(callback, state, "✅ Сохранено.\n\n" + text, kb)

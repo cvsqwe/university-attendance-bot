@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS students (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     full_name TEXT NOT NULL UNIQUE,
     role TEXT NOT NULL CHECK(role IN ('starosta', 'deputy', 'student')),
-    telegram_id INTEGER UNIQUE,
+    max_user_id INTEGER UNIQUE,
     registered_at TEXT,
     invite_token TEXT UNIQUE
 );
@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     notify_dt TEXT NOT NULL,
     close_dt TEXT NOT NULL,
     notified INTEGER NOT NULL DEFAULT 0,
+    reminded INTEGER NOT NULL DEFAULT 0,
     closed INTEGER NOT NULL DEFAULT 0,
     UNIQUE(schedule_id, date)
 );
@@ -72,8 +73,8 @@ CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-    chat_id INTEGER NOT NULL,
-    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    message_id TEXT NOT NULL,
     UNIQUE(session_id, student_id)
 );
 
@@ -93,7 +94,7 @@ class Student:
     id: int
     full_name: str
     role: str
-    telegram_id: int | None
+    max_user_id: int | None
     registered_at: str | None
     invite_token: str | None
 
@@ -107,7 +108,7 @@ def _row_to_student(row: aiosqlite.Row) -> Student:
         id=row["id"],
         full_name=row["full_name"],
         role=row["role"],
-        telegram_id=row["telegram_id"],
+        max_user_id=row["max_user_id"],
         registered_at=row["registered_at"],
         invite_token=row["invite_token"],
     )
@@ -134,11 +135,29 @@ class Database:
             if "invite_token" not in cols:
                 await db.execute("ALTER TABLE students ADD COLUMN invite_token TEXT")
                 await db.commit()
+            # Migration from the Telegram-era schema: telegram_id held a
+            # Telegram user id, meaningless on MAX, so registration state
+            # effectively resets — everyone re-registers via their (still
+            # valid) invite link.
+            if "max_user_id" not in cols and "telegram_id" in cols:
+                await db.execute("ALTER TABLE students RENAME COLUMN telegram_id TO max_user_id")
+                await db.execute("UPDATE students SET max_user_id = NULL, registered_at = NULL")
+                await db.commit()
             cur = await db.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_students_invite_token'"
             )
             if await cur.fetchone() is None:
                 await db.execute("CREATE UNIQUE INDEX idx_students_invite_token ON students(invite_token)")
+                await db.commit()
+            cur = await db.execute("PRAGMA table_info(notifications)")
+            notif_cols = {row[1] for row in await cur.fetchall()}
+            if "user_id" not in notif_cols and "chat_id" in notif_cols:
+                await db.execute("ALTER TABLE notifications RENAME COLUMN chat_id TO user_id")
+                await db.commit()
+            cur = await db.execute("PRAGMA table_info(sessions)")
+            session_cols = {row[1] for row in await cur.fetchall()}
+            if "reminded" not in session_cols:
+                await db.execute("ALTER TABLE sessions ADD COLUMN reminded INTEGER NOT NULL DEFAULT 0")
                 await db.commit()
         await self._seed_roster()
         await self._ensure_invite_tokens()
@@ -175,11 +194,11 @@ class Database:
     # ------------------------------------------------------------------
     # Students
     # ------------------------------------------------------------------
-    async def get_student_by_telegram_id(self, telegram_id: int) -> Student | None:
+    async def get_student_by_max_user_id(self, max_user_id: int) -> Student | None:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT * FROM students WHERE telegram_id = ?", (telegram_id,)
+                "SELECT * FROM students WHERE max_user_id = ?", (max_user_id,)
             )
             row = await cur.fetchone()
             return _row_to_student(row) if row else None
@@ -195,7 +214,7 @@ class Database:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT * FROM students WHERE telegram_id IS NULL ORDER BY full_name"
+                "SELECT * FROM students WHERE max_user_id IS NULL ORDER BY full_name"
             )
             rows = await cur.fetchall()
             return [_row_to_student(r) for r in rows]
@@ -207,22 +226,22 @@ class Database:
             row = await cur.fetchone()
             return _row_to_student(row) if row else None
 
-    async def register_student_by_token(self, token: str, telegram_id: int) -> Student | None:
-        """Binds telegram_id to the roster entry that owns this invite token.
+    async def register_student_by_token(self, token: str, max_user_id: int) -> Student | None:
+        """Binds max_user_id to the roster entry that owns this invite token.
         Returns None if the token is unknown, already used, or the
-        telegram_id is already bound to a different roster entry."""
+        max_user_id is already bound to a different roster entry."""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM students WHERE invite_token = ?", (token,))
             row = await cur.fetchone()
-            if row is None or row["telegram_id"] is not None:
+            if row is None or row["max_user_id"] is not None:
                 return None
-            cur = await db.execute("SELECT id FROM students WHERE telegram_id = ?", (telegram_id,))
+            cur = await db.execute("SELECT id FROM students WHERE max_user_id = ?", (max_user_id,))
             if await cur.fetchone() is not None:
                 return None
             await db.execute(
-                "UPDATE students SET telegram_id = ?, registered_at = ? WHERE id = ?",
-                (telegram_id, dt.datetime.now().isoformat(timespec="seconds"), row["id"]),
+                "UPDATE students SET max_user_id = ?, registered_at = ? WHERE id = ?",
+                (max_user_id, dt.datetime.now().isoformat(timespec="seconds"), row["id"]),
             )
             await db.commit()
             cur = await db.execute("SELECT * FROM students WHERE id = ?", (row["id"],))
@@ -246,7 +265,7 @@ class Database:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT * FROM students WHERE telegram_id IS NOT NULL ORDER BY full_name"
+                "SELECT * FROM students WHERE max_user_id IS NOT NULL ORDER BY full_name"
             )
             rows = await cur.fetchall()
             return [_row_to_student(r) for r in rows]
@@ -256,7 +275,7 @@ class Database:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT * FROM students WHERE role IN ('starosta','deputy') "
-                "AND telegram_id IS NOT NULL"
+                "AND max_user_id IS NOT NULL"
             )
             rows = await cur.fetchall()
             return [_row_to_student(r) for r in rows]
@@ -382,6 +401,11 @@ class Database:
             await db.execute("UPDATE sessions SET notified = 1 WHERE id = ?", (session_id,))
             await db.commit()
 
+    async def mark_session_reminded(self, session_id: int) -> None:
+        async with self._connect() as db:
+            await db.execute("UPDATE sessions SET reminded = 1 WHERE id = ?", (session_id,))
+            await db.commit()
+
     async def mark_session_closed(self, session_id: int) -> None:
         async with self._connect() as db:
             await db.execute("UPDATE sessions SET closed = 1 WHERE id = ?", (session_id,))
@@ -418,13 +442,13 @@ class Database:
     # ------------------------------------------------------------------
     # Notifications (sent check-in messages, needed to edit them later)
     # ------------------------------------------------------------------
-    async def add_notification(self, session_id: int, student_id: int, chat_id: int,
-                                message_id: int) -> None:
+    async def add_notification(self, session_id: int, student_id: int, user_id: int,
+                                message_id: str) -> None:
         async with self._connect() as db:
             await db.execute(
-                "INSERT OR REPLACE INTO notifications (session_id, student_id, chat_id, message_id) "
+                "INSERT OR REPLACE INTO notifications (session_id, student_id, user_id, message_id) "
                 "VALUES (?, ?, ?, ?)",
-                (session_id, student_id, chat_id, message_id),
+                (session_id, student_id, user_id, message_id),
             )
             await db.commit()
 
@@ -487,6 +511,20 @@ class Database:
                 "SELECT a.*, s.full_name FROM attendance a "
                 "JOIN students s ON s.id = a.student_id WHERE a.session_id = ?",
                 (session_id,),
+            )
+            return await cur.fetchall()
+
+    async def get_attendance_for_student(self, student_id: int) -> list[aiosqlite.Row]:
+        """Full attendance history for one student, newest first — backs
+        the staff-facing student card."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT a.status, a.marked_at, sess.id AS session_id, sess.date, sess.weekday, "
+                "sess.pair_number, sess.subject "
+                "FROM attendance a JOIN sessions sess ON sess.id = a.session_id "
+                "WHERE a.student_id = ? ORDER BY sess.date DESC, sess.pair_number DESC",
+                (student_id,),
             )
             return await cur.fetchall()
 

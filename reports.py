@@ -136,3 +136,34 @@ async def build_excel_report(db: Database, date_from: dt.date, date_to: dt.date)
     file_path = os.path.join(tmp_dir, file_name)
     wb.save(file_path)
     return file_path
+
+
+async def build_session_excel_report(db: Database, session) -> str:
+    """Single-sheet ФИО+статус list for one just-closed pair — the compact
+    per-pair attachment sent automatically after each class, as opposed to
+    the multi-column period report above."""
+    rows = sorted(await db.get_attendance_for_session(session["id"]), key=lambda r: r["full_name"])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Посещаемость"
+    headers = ["ФИО", "Статус"]
+    widths = [34, 24]
+    _style_header(ws, headers, widths)
+
+    r = 2
+    for row in rows:
+        label, fill = STATUS_DISPLAY[row["status"]]
+        for col, value in enumerate([row["full_name"], label], start=1):
+            cell = ws.cell(row=r, column=col, value=value)
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(horizontal="left" if col == 1 else "center", vertical="center")
+            if col == 2:
+                cell.fill = fill
+        r += 1
+
+    tmp_dir = tempfile.gettempdir()
+    file_name = f"session_{session['id']}.xlsx"
+    file_path = os.path.join(tmp_dir, file_name)
+    wb.save(file_path)
+    return file_path

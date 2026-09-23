@@ -11,7 +11,7 @@ load_dotenv()
 # --------------------------------------------------------------------------
 # Core settings
 # --------------------------------------------------------------------------
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+MAX_BOT_TOKEN: str = os.getenv("MAX_BOT_TOKEN", "")
 DB_PATH: str = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "attendance.db"))
 TIMEZONE: str = "Europe/Moscow"
 
@@ -19,6 +19,14 @@ TIMEZONE: str = "Europe/Moscow"
 NOTIFY_BEFORE_START_MIN: int = 5
 # How many minutes before a class ends the check-in window closes.
 CLOSE_BEFORE_END_MIN: int = 10
+# How many minutes before the check-in window closes the "hurry up" nudge
+# fires, to students who haven't checked in yet.
+REMINDER_BEFORE_CLOSE_MIN: int = 2
+
+# Weekly nudge to staff listing anyone still unregistered.
+UNREGISTERED_REMINDER_WEEKDAY_CRON: str = "mon"
+UNREGISTERED_REMINDER_HOUR: int = 9
+UNREGISTERED_REMINDER_MINUTE: int = 0
 
 # --------------------------------------------------------------------------
 # Bell schedule (MSK). Pair number -> (start "HH:MM", end "HH:MM")

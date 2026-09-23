@@ -4,7 +4,7 @@ was the exact clutter the panel design replaces.
 """
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from maxapi.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 Row = list[InlineKeyboardButton]
 
@@ -24,6 +24,10 @@ def main_menu_kb(is_staff: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔗 Ссылки", callback_data="menu:invites"),
         ])
         rows.append([InlineKeyboardButton(text="👥 Кто на паре", callback_data="menu:live")])
+        rows.append([
+            InlineKeyboardButton(text="🗂 Карточка студента", callback_data="menu:card"),
+            InlineKeyboardButton(text="📝➕ Групповой пропуск", callback_data="menu:bulk_excuse"),
+        ])
     rows.append([InlineKeyboardButton(text="❓ Помощь", callback_data="menu:help")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

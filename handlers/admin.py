@@ -9,27 +9,23 @@ from __future__ import annotations
 
 import datetime as dt
 import os
-from urllib.parse import quote
 
-from aiogram import Bot, F, Router
-from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
-    FSInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+from magic_filter import F
+
 import config
 import panel
 from access import require_staff as _require_staff, require_staff_cb as _require_staff_cb
 from database import Database
 from keyboards import back_to_menu_kb, with_back_to_menu
+from maxapi.client import MaxClient
+from maxapi.filters import Command
+from maxapi.router import Router
+from maxapi.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from reports import build_excel_report
 from scheduler import AttendanceScheduler
-from utils import STATUS_LABELS, STATUS_LABELS_SHORT, fmt_date_human, today_msk
+from utils import ROLE_LABELS, STATUS_LABELS, STATUS_LABELS_SHORT, fmt_date_human, today_msk, weekday_ru_for
 
 router = Router(name="admin")
 
@@ -39,7 +35,7 @@ PanelTarget = Message | CallbackQuery
 # ----------------------------------------------------------------------
 # Invite links — the only way a new account gets registered. Each roster
 # entry owns a one-time secret token; the starosta/deputy hands out the
-# t.me deep link built from it, and /start binds automatically.
+# max.ru deep link built from it, and /start binds automatically.
 # ----------------------------------------------------------------------
 async def _invite_list_view(db: Database) -> tuple[str, InlineKeyboardMarkup]:
     unregistered = await db.get_unregistered_students()
@@ -53,24 +49,23 @@ async def _invite_list_view(db: Database) -> tuple[str, InlineKeyboardMarkup]:
     return text, with_back_to_menu(buttons)
 
 
-async def _render_invite_card(callback: CallbackQuery, db: Database, bot: Bot, state: FSMContext,
+async def _render_invite_card(callback: CallbackQuery, db: Database, bot: MaxClient, state: FSMContext,
                                student_id: int, toast: str | None = None) -> None:
     target = await db.get_student_by_id(student_id)
-    if target is None or target.telegram_id is not None:
+    if target is None or target.max_user_id is not None:
         await callback.answer("Этот человек уже зарегистрирован.", show_alert=True)
         return
 
     me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start={target.invite_token}"
-    share_text = f"Ссылка для регистрации в боте посещаемости — {target.full_name}"
-    share_url = "tg://msg_url?url=" + quote(link, safe="") + "&text=" + quote(share_text, safe="")
+    link = f"https://max.ru/{me.username}?start={target.invite_token}"
 
     text = (
         f"👤 <b>{target.full_name}</b>\n\n"
-        f"Ссылка для регистрации (одноразовая):\n<code>{link}</code>"
+        f"Ссылка для регистрации (одноразовая):\n<code>{link}</code>\n\n"
+        "Перешлите её человеку любым способом (нет прямой кнопки «Отправить в чат», как в Telegram, "
+        "поэтому ссылку нужно скопировать вручную)."
     )
     buttons = [
-        [InlineKeyboardButton(text="📤 Отправить в чат", url=share_url)],
         [InlineKeyboardButton(text="🔄 Перевыпустить ссылку", callback_data=f"inv:regen:{student_id}")],
         [InlineKeyboardButton(text="⬅ К списку", callback_data="inv:back")],
     ]
@@ -102,7 +97,7 @@ async def cb_invites_back(callback: CallbackQuery, db: Database, state: FSMConte
 
 
 @router.callback_query(F.data.startswith("inv:show:"))
-async def cb_invite_show(callback: CallbackQuery, db: Database, bot: Bot, state: FSMContext) -> None:
+async def cb_invite_show(callback: CallbackQuery, db: Database, bot: MaxClient, state: FSMContext) -> None:
     if await _require_staff_cb(callback, db) is None:
         return
     student_id = int(callback.data.split(":", 2)[2])
@@ -110,7 +105,7 @@ async def cb_invite_show(callback: CallbackQuery, db: Database, bot: Bot, state:
 
 
 @router.callback_query(F.data.startswith("inv:regen:"))
-async def cb_invite_regen(callback: CallbackQuery, db: Database, bot: Bot, state: FSMContext) -> None:
+async def cb_invite_regen(callback: CallbackQuery, db: Database, bot: MaxClient, state: FSMContext) -> None:
     if await _require_staff_cb(callback, db) is None:
         return
     student_id = int(callback.data.split(":", 2)[2])
@@ -451,13 +446,14 @@ async def _send_report_for_period(target: PanelTarget, db: Database, state: FSMC
         )
         return
 
-    chat_id = target.message.chat.id if isinstance(target, CallbackQuery) else target.chat.id
+    user_id = target.from_user.id
     file_path = await build_excel_report(db, date_from, date_to)
     try:
         await target.bot.send_document(
-            chat_id,
-            FSInputFile(file_path, filename=f"Посещаемость_{date_from.strftime('%m.%Y')}.xlsx"),
+            file_path,
+            f"Посещаемость_{date_from.strftime('%m.%Y')}.xlsx",
             caption=f"📊 Отчёт по посещаемости за {date_from.strftime('%m.%Y')}",
+            user_id=user_id,
         )
     finally:
         os.remove(file_path)
@@ -574,13 +570,13 @@ async def cb_live_session(callback: CallbackQuery, db: Database, state: FSMConte
         "",
     ]
     for st in students:
-        name = st.full_name if st.telegram_id is not None else f"{st.full_name} (не зарегистрирован)"
+        name = st.full_name if st.max_user_id is not None else f"{st.full_name} (не зарегистрирован)"
         attendance = await db.get_attendance(session_id, st.id)
         if attendance:
             label = STATUS_LABELS[attendance["status"]]
         elif session["closed"]:
             label = "❌ Отсутствовал"
-        elif st.telegram_id is None:
+        elif st.max_user_id is None:
             label = "❌ Будет отмечен как отсутствующий при закрытии"
         else:
             label = "⏳ Ещё не отметился"
@@ -603,12 +599,249 @@ async def cb_live_excel_today(callback: CallbackQuery, db: Database, state: FSMC
     file_path = await build_excel_report(db, today, today)
     try:
         await callback.bot.send_document(
-            callback.message.chat.id,
-            FSInputFile(file_path, filename=f"Посещаемость_{today.isoformat()}.xlsx"),
+            file_path,
+            f"Посещаемость_{today.isoformat()}.xlsx",
             caption=f"📊 Посещаемость за сегодня, {fmt_date_human(today)} (включая ещё не закрытые пары)",
+            user_id=callback.from_user.id,
         )
     finally:
         os.remove(file_path)
 
     text, kb = await _today_sessions_view(db)
     await panel.show(callback, state, text, kb)
+
+
+# ----------------------------------------------------------------------
+# Student card ("🗂 Карточка студента") — one person's full attendance
+# history and current percentage, for when "Кто на паре" isn't enough.
+# ----------------------------------------------------------------------
+async def _student_list_view(db: Database) -> tuple[str, InlineKeyboardMarkup]:
+    students = await db.get_all_students()
+    buttons = [
+        [InlineKeyboardButton(text=s.full_name, callback_data=f"card:show:{s.id}")]
+        for s in students
+    ]
+    return "Выберите студента, чтобы посмотреть карточку:", with_back_to_menu(buttons)
+
+
+async def _render_student_card(target: PanelTarget, db: Database, state: FSMContext, student_id: int) -> None:
+    student = await db.get_student_by_id(student_id)
+    if student is None:
+        return
+
+    rows = await db.get_attendance_for_student(student_id)
+    present = sum(1 for r in rows if r["status"] == "present")
+    absent = sum(1 for r in rows if r["status"] == "absent")
+    excused = sum(1 for r in rows if r["status"] == "excused")
+    total = len(rows)
+    pct = round(present / total * 100) if total else 0
+
+    reg_line = f"✅ Зарегистрирован {student.registered_at}" if student.max_user_id else "❌ Не зарегистрирован"
+    lines = [
+        f"🗂 <b>{student.full_name}</b>",
+        f"Роль: {ROLE_LABELS[student.role]}",
+        reg_line,
+        "",
+        f"Всего пар: {total}",
+        f"✅ Присутствовал: {present}",
+        f"❌ Отсутствовал: {absent}",
+        f"📝 Уважительная причина: {excused}",
+        f"📈 Посещаемость: {pct}%",
+    ]
+
+    recent_gaps = [r for r in rows if r["status"] in ("absent", "excused")][:10]
+    if recent_gaps:
+        lines.append("")
+        lines.append("<b>Последние пропуски:</b>")
+        for r in recent_gaps:
+            icon = "❌" if r["status"] == "absent" else "📝"
+            lines.append(f"{icon} {r['date']} · Пара {r['pair_number']} · {r['subject']}")
+
+    buttons = [[InlineKeyboardButton(text="⬅ К списку", callback_data="menu:card")]]
+    await panel.show(target, state, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data == "menu:card")
+async def cb_menu_card(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    text, kb = await _student_list_view(db)
+    await panel.show(callback, state, text, kb)
+
+
+@router.callback_query(F.data.startswith("card:show:"))
+async def cb_card_show(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    student_id = int(callback.data.split(":", 2)[2])
+    await _render_student_card(callback, db, state, student_id)
+
+
+# ----------------------------------------------------------------------
+# Group excuse ("📝➕ Групповой пропуск") — mark several students excused
+# for one date in a single flow, instead of one-by-one via "Корректировка".
+# ----------------------------------------------------------------------
+class BulkExcuseStates(StatesGroup):
+    waiting_custom_reason = State()
+
+
+def _bulk_excuse_day_keyboard() -> InlineKeyboardMarkup:
+    today = today_msk()
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i in range(7):
+        date = today + dt.timedelta(days=i)
+        if i == 0:
+            label = "Сегодня"
+        elif i == 1:
+            label = "Завтра"
+        else:
+            label = f"{weekday_ru_for(date)} {date.strftime('%d.%m')}"
+        row.append(InlineKeyboardButton(text=label, callback_data=f"bexc:day:{date.isoformat()}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return with_back_to_menu(buttons)
+
+
+async def _bulk_excuse_student_kb(db: Database, selected: list[int]) -> InlineKeyboardMarkup:
+    students = await db.get_all_students()
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{'☑️' if s.id in selected else '⬜'} {s.full_name}",
+            callback_data=f"bexc:toggle:{s.id}",
+        )]
+        for s in students
+    ]
+    buttons.append([InlineKeyboardButton(text=f"✅ Готово ({len(selected)})", callback_data="bexc:done")])
+    buttons.append([InlineKeyboardButton(text="⬅ Отмена", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _bulk_excuse_reason_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=reason, callback_data=f"bexc:reason:{reason}")]
+        for reason in config.ABSENCE_REASON_CHIPS
+    ]
+    buttons.append([InlineKeyboardButton(text="Другое (ввести текст)", callback_data="bexc:reason_custom")])
+    buttons.append([InlineKeyboardButton(text="⬅ Назад", callback_data="bexc:back_students")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "menu:bulk_excuse")
+async def cb_menu_bulk_excuse(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    await panel.clear_keep_panel(state)
+    await panel.show(callback, state, "На какой день оформить групповой пропуск?", _bulk_excuse_day_keyboard())
+
+
+@router.callback_query(F.data.startswith("bexc:day:"))
+async def cb_bulk_excuse_day(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    date_iso = callback.data.split(":", 2)[2]
+    await state.update_data(bexc_date=date_iso, bexc_selected=[])
+    kb = await _bulk_excuse_student_kb(db, [])
+    date = dt.date.fromisoformat(date_iso)
+    await panel.show(callback, state, f"Выберите студентов, отсутствующих {fmt_date_human(date)}:", kb)
+
+
+async def _rerender_bulk_excuse_picker(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    data = await state.get_data()
+    selected = data.get("bexc_selected", [])
+    date_iso = data.get("bexc_date")
+    if date_iso is None:
+        await callback.answer("Сессия устарела, начните заново.", show_alert=True)
+        await panel.clear_keep_panel(state)
+        await panel.show(callback, state, "На какой день оформить групповой пропуск?", _bulk_excuse_day_keyboard())
+        return
+    date = dt.date.fromisoformat(date_iso)
+    kb = await _bulk_excuse_student_kb(db, selected)
+    await panel.show(callback, state, f"Выберите студентов, отсутствующих {fmt_date_human(date)}:", kb)
+
+
+@router.callback_query(F.data.startswith("bexc:toggle:"))
+async def cb_bulk_excuse_toggle(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    student_id = int(callback.data.split(":", 2)[2])
+    data = await state.get_data()
+    selected = list(data.get("bexc_selected", []))
+    if student_id in selected:
+        selected.remove(student_id)
+    else:
+        selected.append(student_id)
+    await state.update_data(bexc_selected=selected)
+    await _rerender_bulk_excuse_picker(callback, db, state)
+
+
+@router.callback_query(F.data == "bexc:back_students")
+async def cb_bulk_excuse_back_students(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    await _rerender_bulk_excuse_picker(callback, db, state)
+
+
+@router.callback_query(F.data == "bexc:done")
+async def cb_bulk_excuse_done(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    data = await state.get_data()
+    selected = data.get("bexc_selected", [])
+    if not selected:
+        await callback.answer("Выберите хотя бы одного студента.", show_alert=True)
+        return
+    await panel.show(callback, state, f"Причина пропуска для {len(selected)} чел.?", _bulk_excuse_reason_keyboard())
+
+
+async def _apply_bulk_excuse(target: PanelTarget, db: Database, state: FSMContext, reason: str) -> None:
+    data = await state.get_data()
+    date_iso = data.get("bexc_date")
+    selected = data.get("bexc_selected", [])
+
+    names = []
+    for student_id in selected:
+        student = await db.get_student_by_id(student_id)
+        if student is None:
+            continue
+        await db.add_planned_absence(student.id, date_iso, reason)
+        await db.excuse_existing_sessions(student.id, date_iso)
+        names.append(student.full_name)
+
+    await panel.clear_keep_panel(state)
+    date = dt.date.fromisoformat(date_iso)
+    lines = [f"✅ Плановый пропуск на {fmt_date_human(date)} оформлен для {len(names)} чел.:", ""]
+    lines.extend(f"• {n}" for n in names)
+    lines.append("")
+    lines.append(f"Причина: {reason}")
+    await panel.show(target, state, "\n".join(lines), back_to_menu_kb())
+
+
+@router.callback_query(F.data.startswith("bexc:reason:"))
+async def cb_bulk_excuse_reason_chip(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    reason = callback.data.split(":", 2)[2]
+    await _apply_bulk_excuse(callback, db, state, reason)
+
+
+@router.callback_query(F.data == "bexc:reason_custom")
+async def cb_bulk_excuse_reason_custom(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    await state.set_state(BulkExcuseStates.waiting_custom_reason)
+    await panel.show(
+        callback, state, "Опишите причину пропуска одним сообщением:",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Назад", callback_data="bexc:back_students")]]),
+    )
+
+
+@router.message(BulkExcuseStates.waiting_custom_reason)
+async def msg_bulk_excuse_custom_reason(message: Message, db: Database, state: FSMContext) -> None:
+    if await _require_staff(message, db) is None:
+        return
+    reason = (message.text or "").strip() or "Без указания причины"
+    await _apply_bulk_excuse(message, db, state, reason)
