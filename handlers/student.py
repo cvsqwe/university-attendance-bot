@@ -60,6 +60,14 @@ async def cb_menu_home(callback: CallbackQuery, db: Database, state: FSMContext)
     await render_main_menu(callback, db, state)
 
 
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, db: Database, state: FSMContext) -> None:
+    # Escape hatch if the panel message got lost/deleted or a wizard state
+    # got stuck — resets state and re-renders (or re-sends) the menu.
+    await state.set_state(None)
+    await render_main_menu(message, db, state)
+
+
 # ----------------------------------------------------------------------
 # Registration: /start <invite_token> (deep link), /register
 #
@@ -179,6 +187,45 @@ async def cmd_today(message: Message, db: Database, state: FSMContext) -> None:
 @router.callback_query(F.data == "menu:today")
 async def cb_menu_today(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
     await _render_today(callback, db, state)
+
+
+# ----------------------------------------------------------------------
+# /week — read-only view of the whole week's schedule, open to everyone
+# (as opposed to "🗓 Расписание", the staff-only editor).
+# ----------------------------------------------------------------------
+async def _render_week(target: PanelTarget, db: Database, state: FSMContext) -> None:
+    entries = await db.get_full_schedule()
+    if not entries:
+        await panel.show(target, state, "🗓 Расписание пока не заполнено.", back_to_menu_kb())
+        return
+
+    by_day: dict[str, list] = {}
+    for entry in entries:
+        by_day.setdefault(entry["weekday"], []).append(entry)
+
+    lines = ["🗓 <b>Расписание на неделю</b>"]
+    for day in config.WORKING_WEEKDAYS_RU:
+        if day not in by_day:
+            continue
+        lines.append("")
+        lines.append(f"<b>{config.WEEKDAY_FULL_RU[day]}</b>")
+        for entry in sorted(by_day[day], key=lambda e: e["pair_number"]):
+            lines.append(
+                f"{entry['pair_number']}. {entry['start_time']}–{entry['end_time']} "
+                f"{entry['subject']} ({entry['class_type']}) — {entry['teacher']}"
+            )
+
+    await panel.show(target, state, "\n".join(lines), back_to_menu_kb())
+
+
+@router.message(Command("week"))
+async def cmd_week(message: Message, db: Database, state: FSMContext) -> None:
+    await _render_week(message, db, state)
+
+
+@router.callback_query(F.data == "menu:week")
+async def cb_menu_week(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    await _render_week(callback, db, state)
 
 
 # ----------------------------------------------------------------------
@@ -364,7 +411,10 @@ async def _render_help(target: PanelTarget, db: Database, state: FSMContext) -> 
     lines = [
         "<b>Меню бота</b>",
         "📅 Сегодня — расписание и статус на сегодня",
+        "🗓 Неделя — расписание на всю неделю (только просмотр)",
         "📝 Пропуск — оформить плановый пропуск дня",
+        "",
+        "Команда /menu возвращает это меню, если панель потерялась.",
     ]
     if student and student.is_staff:
         lines += [
@@ -376,6 +426,8 @@ async def _render_help(target: PanelTarget, db: Database, state: FSMContext) -> 
             "👥 Кто на паре — статус текущих/сегодняшних пар в реальном времени, "
             "можно смотреть до закрытия отметки, плюс Excel-выгрузка за сегодня",
             "🔗 Ссылки — выдать/перевыпустить пригласительную ссылку для регистрации",
+            "🗂 Карточка студента — история посещаемости и % по конкретному человеку",
+            "📝➕ Групповой пропуск — отметить сразу нескольких студентов уважительной причиной",
             "",
             "Каждую субботу сразу после последней пары старосте и заместителю "
             "автоматически приходит Excel-отчёт за всю неделю.",

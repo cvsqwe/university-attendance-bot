@@ -13,6 +13,7 @@ def main_menu_kb(is_staff: bool) -> InlineKeyboardMarkup:
     rows: list[Row] = [
         [InlineKeyboardButton(text="📅 Сегодня", callback_data="menu:today"),
          InlineKeyboardButton(text="📝 Пропуск", callback_data="menu:absence")],
+        [InlineKeyboardButton(text="🗓 Неделя", callback_data="menu:week")],
     ]
     if is_staff:
         rows.append([
