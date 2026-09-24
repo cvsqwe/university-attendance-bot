@@ -1,11 +1,3 @@
-"""Thin async client for the MAX bot REST API
-(https://github.com/max-messenger/api-schema).
-
-Only wraps the handful of methods this bot needs: sending/editing/deleting
-messages, answering callback button presses, uploading+sending a file, and
-long-polling for updates. No code generator used — the schema is small
-enough to hand-wrap directly.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -22,11 +14,7 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://platform-api2.max.ru"
 
-# platform-api2.max.ru's certificate chains to the Russian Ministry of
-# Digital Development's root CA, which isn't in standard trust stores
-# (regular internet HTTPS works fine — only this Russian-government-issued
-# chain doesn't validate by default). Trusting it here, on top of the
-# normal certifi bundle, avoids requiring a system-wide certificate install.
+
 _RUSSIAN_ROOT_CA = Path(__file__).parent / "certs" / "russian_trusted_root_ca.pem"
 
 
@@ -106,10 +94,7 @@ class MaxClient:
         await self._request("DELETE", "/messages", params={"message_id": message_id})
 
     async def answer_callback(self, callback_id: str, *, notification: str | None = None) -> None:
-        # The API rejects an answer that sets neither `message` nor
-        # `notification` (400 proto.payload) — most of our calls are a bare
-        # acknowledgement with nothing to say, so fall back to an empty
-        # toast, which renders as no visible popup.
+     
         body = {"notification": notification if notification is not None else ""}
         await self._request("POST", "/answers", params={"callback_id": callback_id}, json=body)
 
@@ -138,19 +123,14 @@ class MaxClient:
             raise MaxApiError(200, "upload.bad_response", f"Unexpected upload response shape: {payload}")
         return token
 
-    async def send_document(self, file_path: str, filename: str, *, caption: str | None = None,
-                             user_id: int | None = None, chat_id: int | None = None, format: str = "html"):
-        token = await self._upload_file_token(file_path, filename)
+    async def _send_file_attachment(self, token: str, *, caption: str | None = None,
+                                     user_id: int | None = None, chat_id: int | None = None,
+                                     format: str = "html"):
         body: dict = {"attachments": [{"type": "file", "payload": {"token": token}}]}
         if caption:
             body["text"] = caption
             body["format"] = format
 
-        # The server processes the uploaded binary asynchronously — sending
-        # the message immediately after upload routinely 400s with
-        # attachment.not.ready until processing finishes (documented MAX
-        # behaviour, not specific to file size). Retry with backoff instead
-        # of failing the whole report.
         delays = [1, 2, 3, 5, 8]
         for attempt, delay in enumerate([0, *delays]):
             if delay:
@@ -165,6 +145,23 @@ class MaxClient:
                     raise
                 logger.info("Attachment not processed yet, retrying in %ss (attempt %d/%d)",
                             delay or delays[0], attempt + 1, len(delays) + 1)
+
+    async def send_document(self, file_path: str, filename: str, *, caption: str | None = None,
+                             user_id: int | None = None, chat_id: int | None = None, format: str = "html"):
+        token = await self._upload_file_token(file_path, filename)
+        return await self._send_file_attachment(
+            token, caption=caption, user_id=user_id, chat_id=chat_id, format=format
+        )
+
+    async def send_file_by_token(self, token: str, *, caption: str | None = None,
+                                  user_id: int | None = None, chat_id: int | None = None,
+                                  format: str = "html"):
+        """Re-sends a file MAX already has (e.g. a homework upload some
+        student sent to the bot earlier) by its attachment token, without
+        downloading and re-uploading the binary."""
+        return await self._send_file_attachment(
+            token, caption=caption, user_id=user_id, chat_id=chat_id, format=format
+        )
 
     # ------------------------------------------------------------------
     async def get_updates(self, *, marker: int | None = None, timeout: int = 30,

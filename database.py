@@ -87,6 +87,33 @@ CREATE TABLE IF NOT EXISTS planned_absences (
     UNIQUE(student_id, date)
 );
 
+-- A propusk for one or more specific pairs on a date, as opposed to
+-- planned_absences above which excuses the whole day. Kept as a separate
+-- table (rather than a nullable pair_number column on planned_absences)
+-- so the whole-day UNIQUE(student_id, date) constraint stays simple.
+CREATE TABLE IF NOT EXISTS planned_absence_pairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    date TEXT NOT NULL,
+    pair_number INTEGER NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(student_id, date, pair_number)
+);
+
+-- Homework shared by anyone in the group, browsable by subject. Files are
+-- stored by MAX's upload token only (see MaxClient.send_document /
+-- send_file_by_token) — the binary itself lives on MAX's servers.
+CREATE TABLE IF NOT EXISTS homework (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    subject TEXT NOT NULL,
+    description TEXT,
+    file_token TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    uploaded_at TEXT NOT NULL
+);
+
 -- "Employees": report-only viewers (e.g. deanery staff) who aren't on the
 -- student roster at all and don't get a personal invite link — instead
 -- everyone shares one reusable token (see employee_invite below).
@@ -642,6 +669,172 @@ class Database:
                 "SELECT pa.*, s.full_name FROM planned_absences pa "
                 "JOIN students s ON s.id = pa.student_id WHERE pa.date = ?",
                 (date,),
+            )
+            return await cur.fetchall()
+
+    async def remove_planned_absence(self, student_id: int, date: str) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM planned_absences WHERE student_id = ? AND date = ?", (student_id, date)
+            )
+            await db.commit()
+
+    async def get_excused_students_for_session(self, session_id: int) -> list[aiosqlite.Row]:
+        """Students marked 'excused' on a given session, regardless of
+        whether that came from a whole-day propusk, a single-pair propusk,
+        or a staff override — used for the post-close summary report."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT s.full_name FROM attendance a JOIN students s ON s.id = a.student_id "
+                "WHERE a.session_id = ? AND a.status = 'excused'",
+                (session_id,),
+            )
+            return await cur.fetchall()
+
+    async def revert_excused_for_open_sessions(self, student_id: int, date: str) -> None:
+        """Undoes auto-excused attendance for this student on sessions that
+        haven't closed yet — used when a whole-day planned absence is
+        cancelled so the student goes back through the normal notify/
+        check-in flow. Skips any pair that still has its own active
+        single-pair propusk."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id, pair_number FROM sessions WHERE date = ? AND closed = 0", (date,)
+            )
+            sessions = await cur.fetchall()
+            for sess in sessions:
+                cur = await db.execute(
+                    "SELECT 1 FROM planned_absence_pairs WHERE student_id = ? AND date = ? AND pair_number = ?",
+                    (student_id, date, sess["pair_number"]),
+                )
+                if await cur.fetchone() is not None:
+                    continue
+                await db.execute(
+                    "DELETE FROM attendance WHERE session_id = ? AND student_id = ? AND status = 'excused'",
+                    (sess["id"], student_id),
+                )
+            await db.commit()
+
+    async def revert_excused_for_open_session_pair(self, student_id: int, date: str, pair_number: int) -> None:
+        """Same as above but scoped to a single pair — used when a
+        single-lecture propusk is cancelled."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id FROM sessions WHERE date = ? AND pair_number = ? AND closed = 0",
+                (date, pair_number),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return
+            await db.execute(
+                "DELETE FROM attendance WHERE session_id = ? AND student_id = ? AND status = 'excused'",
+                (row["id"], student_id),
+            )
+            await db.commit()
+
+    # ------------------------------------------------------------------
+    # Planned absences — single pair (propusk for one specific lecture,
+    # as opposed to the whole-day planned_absences above)
+    # ------------------------------------------------------------------
+    async def add_planned_absence_pair(self, student_id: int, date: str, pair_number: int, reason: str) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO planned_absence_pairs (student_id, date, pair_number, reason, created_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(student_id, date, pair_number) DO UPDATE SET reason = excluded.reason, "
+                "created_at = excluded.created_at",
+                (student_id, date, pair_number, reason, dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            await db.commit()
+
+    async def get_planned_absence_pair(self, student_id: int, date: str, pair_number: int) -> aiosqlite.Row | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM planned_absence_pairs WHERE student_id = ? AND date = ? AND pair_number = ?",
+                (student_id, date, pair_number),
+            )
+            return await cur.fetchone()
+
+    async def remove_planned_absence_pair(self, student_id: int, date: str, pair_number: int) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM planned_absence_pairs WHERE student_id = ? AND date = ? AND pair_number = ?",
+                (student_id, date, pair_number),
+            )
+            await db.commit()
+
+    async def excuse_existing_session_pair(self, student_id: int, date: str, pair_number: int) -> None:
+        """Same idea as excuse_existing_sessions, but scoped to one pair —
+        needed when a single-lecture propusk is declared after that pair's
+        session row already exists."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id FROM sessions WHERE date = ? AND pair_number = ?", (date, pair_number)
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return
+            session_id = row["id"]
+            cur = await db.execute(
+                "SELECT status FROM attendance WHERE session_id = ? AND student_id = ?",
+                (session_id, student_id),
+            )
+            attendance = await cur.fetchone()
+            if attendance and attendance["status"] == "present":
+                return
+            await db.execute(
+                "INSERT INTO attendance (session_id, student_id, status, marked_at) "
+                "VALUES (?, ?, 'excused', ?) "
+                "ON CONFLICT(session_id, student_id) DO UPDATE SET status = 'excused', "
+                "marked_at = excluded.marked_at",
+                (session_id, student_id, dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            await db.commit()
+
+    # ------------------------------------------------------------------
+    # Homework — uploaded by anyone, browsable by subject
+    # ------------------------------------------------------------------
+    async def add_homework(self, student_id: int, subject: str, description: str | None,
+                            file_token: str, file_name: str) -> int:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "INSERT INTO homework (student_id, subject, description, file_token, file_name, uploaded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (student_id, subject, description, file_token, file_name,
+                 dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            await db.commit()
+            return cur.lastrowid
+
+    async def get_homework_for_subject(self, subject: str) -> list[aiosqlite.Row]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT h.*, s.full_name FROM homework h JOIN students s ON s.id = h.student_id "
+                "WHERE h.subject = ? ORDER BY h.uploaded_at DESC",
+                (subject,),
+            )
+            return await cur.fetchall()
+
+    async def get_homework_by_id(self, homework_id: int) -> aiosqlite.Row | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT h.*, s.full_name FROM homework h JOIN students s ON s.id = h.student_id "
+                "WHERE h.id = ?",
+                (homework_id,),
+            )
+            return await cur.fetchone()
+
+    async def get_homework_subject_counts(self) -> list[tuple[str, int]]:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT subject, COUNT(*) FROM homework GROUP BY subject ORDER BY MAX(uploaded_at) DESC"
             )
             return await cur.fetchall()
 

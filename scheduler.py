@@ -223,7 +223,8 @@ class AttendanceScheduler:
         )
         for student in students:
             planned = await self.db.get_planned_absence(student.id, date_iso)
-            if planned:
+            planned_pair = await self.db.get_planned_absence_pair(student.id, date_iso, entry["pair_number"])
+            if planned or planned_pair:
                 await self.db.mark_attendance(session_id, student.id, "excused")
                 continue
 
@@ -312,7 +313,7 @@ class AttendanceScheduler:
             await self.db.mark_attendance(session_id, student.id, "absent")
             absent_names.append(f"{student.full_name} (не зарегистрирован)")
 
-        excused_rows = await self.db.get_planned_absences_for_date(session["date"])
+        excused_rows = await self.db.get_excused_students_for_session(session_id)
         excused_names = [row["full_name"] for row in excused_rows]
 
         await self.db.mark_session_closed(session_id)

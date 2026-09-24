@@ -65,6 +65,25 @@ class Message:
     from_user: User
     text: str | None
     bot: "MaxClient" = field(repr=False)
+    attachments: list[dict] = field(default_factory=list)
+
+    def get_file_attachment(self) -> dict | None:
+        """First file-type attachment on an incoming message (e.g. a
+        homework upload), or None. MAX echoes an uploaded file's token
+        back in the same shape used to send one (payload.token), plus the
+        original filename either at the top level or inside payload —
+        this reads both spots defensively since the exact placement isn't
+        documented."""
+        for att in self.attachments:
+            if att.get("type") != "file":
+                continue
+            payload = att.get("payload") or {}
+            token = payload.get("token")
+            if not token:
+                continue
+            filename = att.get("filename") or payload.get("filename") or payload.get("name") or "файл"
+            return {"token": token, "filename": filename}
+        return None
 
     async def answer(self, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> "Message":
         return await self.bot.send_message(text, user_id=self.from_user.id, keyboard=reply_markup)
@@ -119,4 +138,5 @@ def message_from_dict(data: dict | None, bot: "MaxClient") -> Message | None:
         from_user=sender,
         text=body.get("text"),
         bot=bot,
+        attachments=body.get("attachments") or [],
     )

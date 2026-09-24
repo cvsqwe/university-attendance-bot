@@ -19,8 +19,9 @@ from magic_filter import F
 
 import config
 import panel
-from database import Database
+from database import Database, Student
 from keyboards import back_to_menu_kb, employee_menu_kb, main_menu_kb, with_back_to_menu
+from maxapi.client import MaxApiError, MaxClient
 from maxapi.filters import Command, CommandObject, CommandStart
 from maxapi.router import Router
 from maxapi.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -41,8 +42,21 @@ PanelTarget = Message | CallbackQuery
 
 
 class AbsenceStates(StatesGroup):
+    choosing_pairs = State()
     choosing_reason = State()
     waiting_custom_reason = State()
+
+
+async def _notify_staff_of_absence(db: Database, bot: MaxClient, student: Student, text: str) -> None:
+    """Lets the starosta/deputy know a propusk was just filed — skips the
+    filer themselves if they happen to be staff."""
+    for person in await db.get_staff():
+        if person.id == student.id:
+            continue
+        try:
+            await bot.send_message(text, user_id=person.max_user_id)
+        except MaxApiError:
+            pass
 
 
 NEEDS_INVITE_TEXT = (
@@ -167,6 +181,7 @@ async def _render_today(target: PanelTarget, db: Database, state: FSMContext) ->
         return
 
     today = today_msk()
+    today_iso = today.isoformat()
     weekday_ru = weekday_ru_for(today)
     entries = await db.get_schedule_for_weekday(weekday_ru)
 
@@ -174,19 +189,26 @@ async def _render_today(target: PanelTarget, db: Database, state: FSMContext) ->
         await panel.show(target, state, f"📅 Сегодня, {fmt_date_human(today)}, занятий нет.", back_to_menu_kb())
         return
 
-    planned_absence = await db.get_planned_absence(student.id, today.isoformat())
+    day_planned = await db.get_planned_absence(student.id, today_iso)
 
     lines = [f"📅 Расписание на сегодня, {fmt_date_human(today)}:\n"]
     checkin_buttons: list[list[InlineKeyboardButton]] = []
     for entry in entries:
-        session = await db.get_session_by_schedule_and_date(entry["id"], today.isoformat())
+        session = await db.get_session_by_schedule_and_date(entry["id"], today_iso)
+        pair_planned = await db.get_planned_absence_pair(student.id, today_iso, entry["pair_number"])
         status_text = "⏳ ещё не началась"
-        if planned_absence:
-            status_text = "📝 Уважительная причина (плановый пропуск)"
-        elif session:
+
+        if session:
             attendance = await db.get_attendance(session["id"], student.id)
             if attendance:
                 status_text = STATUS_LABELS[attendance["status"]]
+                # Filed a propusk but actually made it — let them flip
+                # themselves back to "present" while the window is open.
+                if attendance["status"] == "excused" and not session["closed"]:
+                    checkin_buttons.append([InlineKeyboardButton(
+                        text=f"✅ Всё-таки пришёл на пару {entry['pair_number']}",
+                        callback_data=f"checkin:{session['id']}",
+                    )])
             elif session["closed"]:
                 status_text = "❌ Отсутствовал"
             elif session["notified"]:
@@ -195,6 +217,14 @@ async def _render_today(target: PanelTarget, db: Database, state: FSMContext) ->
                     text=f"✅ Отметиться на паре {entry['pair_number']}",
                     callback_data=f"checkin:{session['id']}",
                 )])
+        elif day_planned or pair_planned:
+            # Session doesn't exist yet (before the notify window) — the
+            # only way back is to cancel the propusk itself.
+            status_text = "📝 Уважительная причина (плановый пропуск)"
+            checkin_buttons.append([InlineKeyboardButton(
+                text=f"↩️ Отменить пропуск на пару {entry['pair_number']}",
+                callback_data=f"absence_cancel_pair:{today_iso}:{entry['pair_number']}",
+            )])
 
         lines.append(
             f"<b>Пара {entry['pair_number']}</b> ({entry['start_time']}–{entry['end_time']})\n"
@@ -205,11 +235,35 @@ async def _render_today(target: PanelTarget, db: Database, state: FSMContext) ->
 
     if checkin_buttons:
         lines.append(
-            "Если пропустили уведомление о начале пары (например, из-за связи) — "
-            "отметьтесь кнопкой ниже, пока отметка не закрыта."
+            "Если пропустили уведомление о начале пары, всё-таки пришли после того как оформили "
+            "пропуск, или передумали — используйте кнопки ниже."
         )
     kb = with_back_to_menu(checkin_buttons) if checkin_buttons else back_to_menu_kb()
     await panel.show(target, state, "\n".join(lines), kb)
+
+
+@router.callback_query(F.data.startswith("absence_cancel_pair:"))
+async def cb_absence_cancel_pair(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    student = await db.get_student_by_max_user_id(callback.from_user.id)
+    if student is None:
+        await callback.answer("Вы не зарегистрированы.", show_alert=True)
+        return
+
+    _, date_iso, pair_s = callback.data.split(":")
+    pair_number = int(pair_s)
+
+    day_planned = await db.get_planned_absence(student.id, date_iso)
+    if day_planned:
+        await db.remove_planned_absence(student.id, date_iso)
+        await db.revert_excused_for_open_sessions(student.id, date_iso)
+        toast = "Плановый пропуск на весь день отменён."
+    else:
+        await db.remove_planned_absence_pair(student.id, date_iso, pair_number)
+        await db.revert_excused_for_open_session_pair(student.id, date_iso, pair_number)
+        toast = "Пропуск на эту пару отменён."
+
+    await callback.answer(toast)
+    await _render_today(callback, db, state)
 
 
 @router.message(Command("today"))
@@ -262,7 +316,9 @@ async def cb_menu_week(callback: CallbackQuery, db: Database, state: FSMContext)
 
 
 # ----------------------------------------------------------------------
-# /absence — planned absence for a whole day
+# /absence — planned absence, either for the whole day or for specific
+# pairs only. Staff (starosta/deputy) get a heads-up message either way —
+# see _notify_staff_of_absence.
 # ----------------------------------------------------------------------
 def _absence_day_keyboard() -> InlineKeyboardMarkup:
     today = today_msk()
@@ -285,6 +341,27 @@ def _absence_day_keyboard() -> InlineKeyboardMarkup:
     return with_back_to_menu(buttons)
 
 
+def _absence_scope_keyboard(date_iso: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Весь день", callback_data=f"absence_scope:day:{date_iso}")],
+        [InlineKeyboardButton(text="🎯 Отдельные пары", callback_data=f"absence_scope:pairs:{date_iso}")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="absence_back_days")],
+    ])
+
+
+def _absence_pairs_keyboard(entries, selected: list[int]) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{'☑️' if e['pair_number'] in selected else '⬜'} Пара {e['pair_number']} — {e['subject']}",
+            callback_data=f"absence_pair_toggle:{e['pair_number']}",
+        )]
+        for e in entries
+    ]
+    buttons.append([InlineKeyboardButton(text=f"✅ Готово ({len(selected)})", callback_data="absence_pairs_done")])
+    buttons.append([InlineKeyboardButton(text="⬅ Назад", callback_data="absence_back_days")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def _absence_reason_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=reason, callback_data=f"absence_reason:{reason}")]
@@ -301,7 +378,7 @@ async def _render_absence_start(target: PanelTarget, db: Database, state: FSMCon
         await panel.show(target, state, NEEDS_INVITE_TEXT)
         return
     await panel.clear_keep_panel(state)
-    await panel.show(target, state, "На какой день оформить плановый пропуск?", _absence_day_keyboard())
+    await panel.show(target, state, "На какой день оформить пропуск?", _absence_day_keyboard())
 
 
 @router.message(Command("absence"))
@@ -317,7 +394,7 @@ async def cb_menu_absence(callback: CallbackQuery, db: Database, state: FSMConte
 @router.callback_query(F.data == "absence_back_days")
 async def cb_absence_back_days(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(None)
-    await panel.show(callback, state, "На какой день оформить плановый пропуск?", _absence_day_keyboard())
+    await panel.show(callback, state, "На какой день оформить пропуск?", _absence_day_keyboard())
 
 
 @router.callback_query(F.data.startswith("absence_day:"))
@@ -328,15 +405,132 @@ async def cb_absence_day(callback: CallbackQuery, db: Database, state: FSMContex
         return
 
     date_iso = callback.data.split(":", 1)[1]
-    await state.update_data(absence_date=date_iso)
+    date = dt.date.fromisoformat(date_iso)
+    await state.set_state(None)
+    await state.update_data(absence_date=date_iso, absence_pairs=None)
+
+    entries = await db.get_schedule_for_weekday(weekday_ru_for(date))
+    if not entries:
+        # Nothing on the schedule that day — no pairs to split into,
+        # skip straight to a whole-day propusk (which is a no-op anyway).
+        await state.set_state(AbsenceStates.choosing_reason)
+        await panel.show(callback, state, f"Причина пропуска на {fmt_date_human(date)}?", _absence_reason_keyboard())
+        return
+
+    await panel.show(
+        callback, state, f"Пропуск на {fmt_date_human(date)} — весь день или отдельные пары?",
+        _absence_scope_keyboard(date_iso),
+    )
+
+
+@router.callback_query(F.data.startswith("absence_scope:day:"))
+async def cb_absence_scope_day(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    student = await db.get_student_by_max_user_id(callback.from_user.id)
+    if student is None:
+        await callback.answer("Вы не зарегистрированы.", show_alert=True)
+        return
+
+    date_iso = callback.data.split(":", 2)[2]
+    await state.update_data(absence_date=date_iso, absence_pairs=None)
     await state.set_state(AbsenceStates.choosing_reason)
 
     date = dt.date.fromisoformat(date_iso)
     await panel.show(callback, state, f"Причина пропуска на {fmt_date_human(date)}?", _absence_reason_keyboard())
 
 
+@router.callback_query(F.data.startswith("absence_scope:pairs:"))
+async def cb_absence_scope_pairs(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    student = await db.get_student_by_max_user_id(callback.from_user.id)
+    if student is None:
+        await callback.answer("Вы не зарегистрированы.", show_alert=True)
+        return
+
+    date_iso = callback.data.split(":", 2)[2]
+    date = dt.date.fromisoformat(date_iso)
+    entries = await db.get_schedule_for_weekday(weekday_ru_for(date))
+    if not entries:
+        await callback.answer("На этот день пар нет.", show_alert=True)
+        return
+
+    await state.update_data(absence_date=date_iso, absence_pairs=[])
+    await state.set_state(AbsenceStates.choosing_pairs)
+    await panel.show(callback, state, f"Выберите пары на {fmt_date_human(date)}:", _absence_pairs_keyboard(entries, []))
+
+
+@router.callback_query(AbsenceStates.choosing_pairs, F.data.startswith("absence_pair_toggle:"))
+async def cb_absence_pair_toggle(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    pair_number = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    date_iso = data.get("absence_date")
+    if date_iso is None:
+        await callback.answer("Сессия устарела, начните заново.", show_alert=True)
+        await state.clear()
+        return
+
+    selected = list(data.get("absence_pairs") or [])
+    if pair_number in selected:
+        selected.remove(pair_number)
+    else:
+        selected.append(pair_number)
+    await state.update_data(absence_pairs=selected)
+
+    date = dt.date.fromisoformat(date_iso)
+    entries = await db.get_schedule_for_weekday(weekday_ru_for(date))
+    await panel.show(callback, state, f"Выберите пары на {fmt_date_human(date)}:", _absence_pairs_keyboard(entries, selected))
+
+
+@router.callback_query(AbsenceStates.choosing_pairs, F.data == "absence_pairs_done")
+async def cb_absence_pairs_done(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    selected = data.get("absence_pairs") or []
+    if not selected:
+        await callback.answer("Выберите хотя бы одну пару.", show_alert=True)
+        return
+    await state.set_state(AbsenceStates.choosing_reason)
+    await panel.show(callback, state, f"Причина пропуска для {len(selected)} пар(ы)?", _absence_reason_keyboard())
+
+
+async def _apply_absence(target: PanelTarget, db: Database, bot: MaxClient, state: FSMContext,
+                          student: Student, date_iso: str, pairs: list[int] | None, reason: str) -> None:
+    date = dt.date.fromisoformat(date_iso)
+
+    if pairs:
+        for pair_number in sorted(pairs):
+            await db.add_planned_absence_pair(student.id, date_iso, pair_number, reason)
+            await db.excuse_existing_session_pair(student.id, date_iso, pair_number)
+        pairs_str = ", ".join(str(p) for p in sorted(pairs))
+        await _notify_staff_of_absence(
+            db, bot, student,
+            f"📝 {student.full_name} оформил(а) пропуск пар {pairs_str} на {fmt_date_human(date)}.\n"
+            f"Причина: {reason}",
+        )
+        await panel.clear_keep_panel(state)
+        await panel.show(
+            target, state,
+            f"✅ Пропуск оформлен на {fmt_date_human(date)}, пары: {pairs_str}.\nПричина: {reason}",
+            back_to_menu_kb(),
+        )
+        return
+
+    await db.add_planned_absence(student.id, date_iso, reason)
+    await db.excuse_existing_sessions(student.id, date_iso)
+    await _notify_staff_of_absence(
+        db, bot, student,
+        f"📝 {student.full_name} оформил(а) плановый пропуск на весь день {fmt_date_human(date)}.\n"
+        f"Причина: {reason}",
+    )
+    await panel.clear_keep_panel(state)
+    await panel.show(
+        target, state,
+        f"✅ Плановый пропуск оформлен на {fmt_date_human(date)}.\nПричина: {reason}\n\n"
+        "В этот день вы автоматически будете отмечены как «Уважительная причина» и не будете "
+        "получать уведомления о начале пар.",
+        back_to_menu_kb(),
+    )
+
+
 @router.callback_query(AbsenceStates.choosing_reason, F.data.startswith("absence_reason:"))
-async def cb_absence_reason_chip(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+async def cb_absence_reason_chip(callback: CallbackQuery, db: Database, bot: MaxClient, state: FSMContext) -> None:
     student = await db.get_student_by_max_user_id(callback.from_user.id)
     data = await state.get_data()
     date_iso = data.get("absence_date")
@@ -346,18 +540,7 @@ async def cb_absence_reason_chip(callback: CallbackQuery, db: Database, state: F
         return
 
     reason = callback.data.split(":", 1)[1]
-    await db.add_planned_absence(student.id, date_iso, reason)
-    await db.excuse_existing_sessions(student.id, date_iso)
-    await panel.clear_keep_panel(state)
-
-    date = dt.date.fromisoformat(date_iso)
-    await panel.show(
-        callback, state,
-        f"✅ Плановый пропуск оформлен на {fmt_date_human(date)}.\nПричина: {reason}\n\n"
-        "В этот день вы автоматически будете отмечены как «Уважительная причина» и не будете "
-        "получать уведомления о начале пар.",
-        back_to_menu_kb(),
-    )
+    await _apply_absence(callback, db, bot, state, student, date_iso, data.get("absence_pairs"), reason)
 
 
 @router.callback_query(AbsenceStates.choosing_reason, F.data == "absence_reason_custom")
@@ -370,7 +553,7 @@ async def cb_absence_reason_custom(callback: CallbackQuery, state: FSMContext) -
 
 
 @router.message(AbsenceStates.waiting_custom_reason)
-async def msg_absence_custom_reason(message: Message, db: Database, state: FSMContext) -> None:
+async def msg_absence_custom_reason(message: Message, db: Database, bot: MaxClient, state: FSMContext) -> None:
     student = await db.get_student_by_max_user_id(message.from_user.id)
     data = await state.get_data()
     date_iso = data.get("absence_date")
@@ -380,16 +563,7 @@ async def msg_absence_custom_reason(message: Message, db: Database, state: FSMCo
         return
 
     reason = (message.text or "").strip() or "Без указания причины"
-    await db.add_planned_absence(student.id, date_iso, reason)
-    await db.excuse_existing_sessions(student.id, date_iso)
-    await panel.clear_keep_panel(state)
-
-    date = dt.date.fromisoformat(date_iso)
-    await panel.show(
-        message, state,
-        f"✅ Плановый пропуск оформлен на {fmt_date_human(date)}.\nПричина: {reason}",
-        back_to_menu_kb(),
-    )
+    await _apply_absence(message, db, bot, state, student, date_iso, data.get("absence_pairs"), reason)
 
 
 # ----------------------------------------------------------------------
@@ -412,11 +586,16 @@ async def cb_checkin(callback: CallbackQuery, db: Database) -> None:
         await callback.answer("Окно отметки уже закрыто.", show_alert=True)
         return
 
-    now = now_msk()
-    inserted = await db.mark_attendance(session_id, student.id, "present", marked_at=now.isoformat(timespec="seconds"))
-    if not inserted:
+    existing = await db.get_attendance(session_id, student.id)
+    if existing and existing["status"] == "present":
         await callback.answer("Вы уже отмечены на этой паре.", show_alert=True)
         return
+
+    # Overwrites whatever was there before (nothing, "excused" from a
+    # propusk the student is now walking back, or a stale "absent") —
+    # this is also how a self-check-in after filing a propusk works.
+    now = now_msk()
+    await db.set_attendance(session_id, student.id, "present")
 
     time_str = now.strftime("%H:%M")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -455,7 +634,12 @@ async def _render_help(target: PanelTarget, db: Database, state: FSMContext) -> 
         "<b>Меню бота</b>",
         "📅 Сегодня — расписание и статус на сегодня",
         "🗓 Неделя — расписание на всю неделю (только просмотр)",
-        "📝 Пропуск — оформить плановый пропуск дня",
+        "📝 Пропуск — оформить пропуск на весь день или на отдельные пары (с указанием причины); "
+        "о нём автоматически узнают староста и заместитель",
+        "📚 Домашки — загрузить домашнее задание по предмету или скачать то, что загрузили другие",
+        "",
+        "Если оформили пропуск, а всё-таки пришли — откройте «📅 Сегодня»: там появится кнопка "
+        "«✅ Всё-таки пришёл», либо «↩️ Отменить пропуск», если пара ещё не началась.",
         "",
         "Команда /menu возвращает это меню, если панель потерялась.",
     ]
