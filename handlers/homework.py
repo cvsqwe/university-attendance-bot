@@ -23,6 +23,8 @@ router = Router(name="homework")
 
 PanelTarget = Message | CallbackQuery
 
+FILE_TYPE_ICONS = {"file": "📄", "image": "🖼", "video": "🎥", "audio": "🎵"}
+
 
 class HomeworkStates(StatesGroup):
     waiting_file = State()
@@ -59,8 +61,9 @@ async def _render_homework_subject(target: PanelTarget, db: Database, state: FSM
         lines.append("")
         for item in items:
             date_str = item["uploaded_at"][:10]
+            icon = FILE_TYPE_ICONS.get(item["file_type"], "📄")
             buttons.append([InlineKeyboardButton(
-                text=f"📄 {item['file_name']} · {item['full_name']} · {date_str}",
+                text=f"{icon} {item['file_name']} · {item['full_name']} · {date_str}",
                 callback_data=f"hw:get:{item['id']}",
             )])
     buttons.append([InlineKeyboardButton(text="⬅ К предметам", callback_data="menu:homework")])
@@ -109,8 +112,9 @@ async def cb_homework_upload(callback: CallbackQuery, db: Database, state: FSMCo
     await state.set_state(HomeworkStates.waiting_file)
     await panel.show(
         callback, state,
-        f"Отправьте файл с домашкой по предмету «{subject}» одним сообщением.\n"
-        "Подпись к файлу (если добавите) сохранится как описание.",
+        f"Отправьте домашку по предмету «{subject}» одним сообщением — подойдёт документ, "
+        "фото, видео или аудио, в любом формате.\n"
+        "Подпись к вложению (если добавите) сохранится как описание.",
         InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅ Отмена", callback_data=f"hw:subj:{subject}")]
         ]),
@@ -131,7 +135,8 @@ async def msg_homework_file(message: Message, db: Database, state: FSMContext) -
     if attachment is None:
         await panel.show(
             message, state,
-            "Не вижу файла в сообщении. Отправьте домашку как файл (документ), а не текстом.",
+            "Не вижу вложения в сообщении. Отправьте домашку как документ, фото, видео или "
+            "аудио, а не текстом.",
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅ Отмена", callback_data=f"hw:subj:{subject}")]
             ]),
@@ -139,7 +144,9 @@ async def msg_homework_file(message: Message, db: Database, state: FSMContext) -
         return
 
     description = (message.text or "").strip() or None
-    await db.add_homework(student.id, subject, description, attachment["token"], attachment["filename"])
+    await db.add_homework(
+        student.id, subject, description, attachment["token"], attachment["filename"], attachment["type"]
+    )
     await panel.clear_keep_panel(state)
     await _render_homework_subject(message, db, state, subject)
 
@@ -162,7 +169,10 @@ async def cb_homework_get(callback: CallbackQuery, db: Database) -> None:
         caption += f"\n\n{item['description']}"
 
     try:
-        await callback.bot.send_file_by_token(item["file_token"], caption=caption, user_id=callback.from_user.id)
+        await callback.bot.send_file_by_token(
+            item["file_token"], caption=caption, user_id=callback.from_user.id,
+            attachment_type=item["file_type"],
+        )
     except MaxApiError:
         await callback.answer("Не удалось отправить файл — попробуйте позже.", show_alert=True)
         return

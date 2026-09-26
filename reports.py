@@ -54,10 +54,15 @@ async def build_excel_report(db: Database, date_from: dt.date, date_to: dt.date)
     sessions = await db.get_sessions_range(date_from.isoformat(), date_to.isoformat())
     students = await db.get_all_students()
     attendance_rows = await db.get_attendance_range(date_from.isoformat(), date_to.isoformat())
+    grade_rows = await db.get_grades_range(date_from.isoformat(), date_to.isoformat())
 
     status_map: dict[tuple[str, int, int], str] = {}
     for row in attendance_rows:
         status_map[(row["date"], row["pair_number"], row["student_id"])] = row["status"]
+
+    grade_map: dict[tuple[str, int, int], str] = {}
+    for row in grade_rows:
+        grade_map[(row["date"], row["pair_number"], row["student_id"])] = row["grade"]
 
     wb = Workbook()
 
@@ -66,8 +71,8 @@ async def build_excel_report(db: Database, date_from: dt.date, date_to: dt.date)
     # ---------------------------------------------------------------
     ws = wb.active
     ws.title = "Посещаемость"
-    headers = ["Дата", "День", "Пара", "Время", "Предмет", "Тип", "Преподаватель", "Студент", "Статус"]
-    widths = [12, 14, 6, 13, 24, 14, 20, 30, 22]
+    headers = ["Дата", "День", "Пара", "Время", "Предмет", "Тип", "Преподаватель", "Студент", "Статус", "Оценка"]
+    widths = [12, 14, 6, 13, 24, 14, 20, 30, 22, 10]
     _style_header(ws, headers, widths)
 
     r = 2
@@ -81,6 +86,7 @@ async def build_excel_report(db: Database, date_from: dt.date, date_to: dt.date)
                 label, fill = STATUS_DISPLAY["absent"]
             else:
                 label, fill = PENDING_DISPLAY
+            grade = grade_map.get((session["date"], session["pair_number"], student.id), "")
 
             values = [
                 date_obj.strftime("%d.%m.%Y"),
@@ -92,6 +98,7 @@ async def build_excel_report(db: Database, date_from: dt.date, date_to: dt.date)
                 session["teacher"],
                 student.full_name,
                 label,
+                grade,
             ]
             for col, value in enumerate(values, start=1):
                 cell = ws.cell(row=r, column=col, value=value)
@@ -105,14 +112,15 @@ async def build_excel_report(db: Database, date_from: dt.date, date_to: dt.date)
     # Sheet 2: one row per student — totals for the period
     # ---------------------------------------------------------------
     ws2 = wb.create_sheet("Итоги")
-    headers2 = ["ФИО", "Пар всего", "Присутствий", "Пропусков", "По уважит. причине", "% посещаемости"]
-    widths2 = [30, 11, 12, 11, 18, 15]
+    headers2 = ["ФИО", "Пар всего", "Присутствий", "Пропусков", "По уважит. причине", "% посещаемости", "Средний балл"]
+    widths2 = [30, 11, 12, 11, 18, 15, 13]
     _style_header(ws2, headers2, widths2)
 
     total_sessions = len(sessions)
     r = 2
     for student in students:
         present = absent = excused = 0
+        numeric_grades: list[float] = []
         for session in sessions:
             status = status_map.get((session["date"], session["pair_number"], student.id))
             if status == "present":
@@ -121,14 +129,22 @@ async def build_excel_report(db: Database, date_from: dt.date, date_to: dt.date)
                 excused += 1
             elif status == "absent" or (status is None and session["closed"]):
                 absent += 1
+            grade = grade_map.get((session["date"], session["pair_number"], student.id))
+            if grade is not None:
+                try:
+                    numeric_grades.append(float(grade.replace(",", ".")))
+                except ValueError:
+                    pass
         attendance_pct = (present / total_sessions) if total_sessions else 0
+        avg_grade = (sum(numeric_grades) / len(numeric_grades)) if numeric_grades else None
 
-        values = [student.full_name, total_sessions, present, absent, excused, attendance_pct]
+        values = [student.full_name, total_sessions, present, absent, excused, attendance_pct, avg_grade]
         for col, value in enumerate(values, start=1):
             cell = ws2.cell(row=r, column=col, value=value)
             cell.border = THIN_BORDER
             cell.alignment = Alignment(horizontal="center" if col != 1 else "left", vertical="center")
         ws2.cell(row=r, column=6).number_format = "0%"
+        ws2.cell(row=r, column=7).number_format = "0.00"
         r += 1
 
     tmp_dir = tempfile.gettempdir()
@@ -143,18 +159,20 @@ async def build_session_excel_report(db: Database, session) -> str:
     per-pair attachment sent automatically after each class, as opposed to
     the multi-column period report above."""
     rows = sorted(await db.get_attendance_for_session(session["id"]), key=lambda r: r["full_name"])
+    grade_by_student = {g["student_id"]: g["grade"] for g in await db.get_grades_for_session(session["id"])}
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Посещаемость"
-    headers = ["ФИО", "Статус"]
-    widths = [34, 24]
+    headers = ["ФИО", "Статус", "Оценка"]
+    widths = [34, 24, 10]
     _style_header(ws, headers, widths)
 
     r = 2
     for row in rows:
         label, fill = STATUS_DISPLAY[row["status"]]
-        for col, value in enumerate([row["full_name"], label], start=1):
+        grade = grade_by_student.get(row["student_id"], "")
+        for col, value in enumerate([row["full_name"], label, grade], start=1):
             cell = ws.cell(row=r, column=col, value=value)
             cell.border = THIN_BORDER
             cell.alignment = Alignment(horizontal="left" if col == 1 else "center", vertical="center")

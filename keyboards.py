@@ -22,6 +22,10 @@ def main_menu_kb(is_staff: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✏️ Корректировка", callback_data="menu:override"),
         ])
         rows.append([
+            InlineKeyboardButton(text="🏷 Оценки", callback_data="menu:grades"),
+            InlineKeyboardButton(text="🚫 Исключить день", callback_data="menu:exclude_day"),
+        ])
+        rows.append([
             InlineKeyboardButton(text="📊 Отчёт", callback_data="menu:report"),
             InlineKeyboardButton(text="🔗 Ссылки", callback_data="menu:invites"),
         ])

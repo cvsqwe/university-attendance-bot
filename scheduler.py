@@ -166,6 +166,8 @@ class AttendanceScheduler:
             return
 
         date_iso = target_date or _now_naive().date().isoformat()
+        if await self.db.is_date_excluded(date_iso):
+            return
         start_dt = _combine(date_iso, entry["start_time"])
         end_dt = _combine(date_iso, entry["end_time"])
         notify_dt = start_dt - dt.timedelta(minutes=config.NOTIFY_BEFORE_START_MIN)

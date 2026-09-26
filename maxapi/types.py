@@ -68,21 +68,28 @@ class Message:
     attachments: list[dict] = field(default_factory=list)
 
     def get_file_attachment(self) -> dict | None:
-        """First file-type attachment on an incoming message (e.g. a
-        homework upload), or None. MAX echoes an uploaded file's token
-        back in the same shape used to send one (payload.token), plus the
-        original filename either at the top level or inside payload —
-        this reads both spots defensively since the exact placement isn't
-        documented."""
+        """First attachment on an incoming message that carries a
+        re-sendable token — a homework upload, which may be a document, a
+        photo, a video or a voice/audio message. MAX echoes an uploaded
+        attachment's token back in the same shape used to send one
+        (payload.token), plus the original filename either at the top
+        level or inside payload — this reads both spots defensively since
+        the exact placement isn't documented. The attachment's own `type`
+        (e.g. "file", "image", "video", "audio") is kept as-is and reused
+        unchanged when the attachment is re-sent later, so this never needs
+        to know the full set of type strings MAX uses."""
+        default_names = {"image": "изображение", "video": "видео", "audio": "аудио"}
         for att in self.attachments:
-            if att.get("type") != "file":
-                continue
+            att_type = att.get("type")
             payload = att.get("payload") or {}
             token = payload.get("token")
-            if not token:
+            if not att_type or not token:
                 continue
-            filename = att.get("filename") or payload.get("filename") or payload.get("name") or "файл"
-            return {"token": token, "filename": filename}
+            filename = (
+                att.get("filename") or payload.get("filename") or payload.get("name")
+                or default_names.get(att_type, "файл")
+            )
+            return {"token": token, "filename": filename, "type": att_type}
         return None
 
     async def answer(self, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> "Message":

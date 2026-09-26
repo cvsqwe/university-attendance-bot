@@ -125,8 +125,8 @@ class MaxClient:
 
     async def _send_file_attachment(self, token: str, *, caption: str | None = None,
                                      user_id: int | None = None, chat_id: int | None = None,
-                                     format: str = "html"):
-        body: dict = {"attachments": [{"type": "file", "payload": {"token": token}}]}
+                                     format: str = "html", attachment_type: str = "file"):
+        body: dict = {"attachments": [{"type": attachment_type, "payload": {"token": token}}]}
         if caption:
             body["text"] = caption
             body["format"] = format
@@ -155,12 +155,16 @@ class MaxClient:
 
     async def send_file_by_token(self, token: str, *, caption: str | None = None,
                                   user_id: int | None = None, chat_id: int | None = None,
-                                  format: str = "html"):
-        """Re-sends a file MAX already has (e.g. a homework upload some
-        student sent to the bot earlier) by its attachment token, without
-        downloading and re-uploading the binary."""
+                                  format: str = "html", attachment_type: str = "file"):
+        """Re-sends an attachment MAX already has (e.g. a homework upload
+        some student sent to the bot earlier) by its token, without
+        downloading and re-uploading the binary. `attachment_type` should
+        match whatever type MAX originally tagged the upload with (file,
+        image, video, audio, ...) — sending it back as a plain "file" would
+        lose the native photo/video rendering."""
         return await self._send_file_attachment(
-            token, caption=caption, user_id=user_id, chat_id=chat_id, format=format
+            token, caption=caption, user_id=user_id, chat_id=chat_id, format=format,
+            attachment_type=attachment_type,
         )
 
     # ------------------------------------------------------------------

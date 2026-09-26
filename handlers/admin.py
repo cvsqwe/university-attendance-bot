@@ -447,6 +447,334 @@ async def cb_override_set(callback: CallbackQuery, db: Database, state: FSMConte
 
 
 # ----------------------------------------------------------------------
+# Grades — one grade per (session, student), set by staff. Reuses the same
+# session→student drill-down as the override flow above.
+# ----------------------------------------------------------------------
+GRADE_CHOICES = ["5", "4", "3", "2"]
+
+
+class GradeStates(StatesGroup):
+    waiting_custom_grade = State()
+
+
+async def _grades_session_list(db: Database) -> tuple[str, InlineKeyboardMarkup]:
+    today = today_msk()
+    date_from = (today - dt.timedelta(days=7)).isoformat()
+    sessions = await db.get_sessions_range(date_from, today.isoformat())
+    if not sessions:
+        return "Нет занятий за последние 7 дней для выставления оценок.", back_to_menu_kb()
+
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{s['date']} · Пара {s['pair_number']} · {s['subject']}",
+            callback_data=f"gr_sess:{s['id']}",
+        )]
+        for s in sessions
+    ]
+    return "Выберите занятие для выставления оценок:", with_back_to_menu(buttons)
+
+
+@router.message(Command("grades"))
+async def cmd_grades(message: Message, db: Database, state: FSMContext) -> None:
+    if await _require_staff(message, db) is None:
+        return
+    text, keyboard = await _grades_session_list(db)
+    await panel.show(message, state, text, keyboard)
+
+
+@router.callback_query(F.data == "menu:grades")
+async def cb_menu_grades(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    text, keyboard = await _grades_session_list(db)
+    await panel.show(callback, state, text, keyboard)
+
+
+@router.callback_query(F.data == "gr_back")
+async def cb_grades_back(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    text, keyboard = await _grades_session_list(db)
+    await panel.show(callback, state, text, keyboard)
+
+
+@router.callback_query(F.data.startswith("gr_sess:"))
+async def cb_grades_session(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+
+    session_id = int(callback.data.split(":", 1)[1])
+    session = await db.get_session(session_id)
+    if session is None:
+        await callback.answer("Занятие не найдено.", show_alert=True)
+        return
+
+    students = await db.get_all_registered_students()
+    buttons = []
+    for st in students:
+        grade = await db.get_grade(session_id, st.id)
+        grade_label = grade["grade"] if grade else "—"
+        buttons.append([InlineKeyboardButton(
+            text=f"{st.full_name} [{grade_label}]",
+            callback_data=f"gr_student:{session_id}:{st.id}",
+        )])
+    buttons.append([InlineKeyboardButton(text="⬅ Назад", callback_data="gr_back")])
+
+    await panel.show(
+        callback, state,
+        f"Занятие: {session['date']} · Пара {session['pair_number']} · {session['subject']}\n"
+        "Выберите студента:",
+        InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("gr_student:"))
+async def cb_grades_student(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+
+    _, session_id_s, student_id_s = callback.data.split(":")
+    session_id, student_id = int(session_id_s), int(student_id_s)
+    target = await db.get_student_by_id(student_id)
+    if target is None:
+        await callback.answer("Студент не найден.", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=g, callback_data=f"gr_set:{session_id}:{student_id}:{g}") for g in GRADE_CHOICES],
+        [InlineKeyboardButton(text="✏️ Другое значение", callback_data=f"gr_custom:{session_id}:{student_id}")],
+        [InlineKeyboardButton(text="🗑 Убрать оценку", callback_data=f"gr_clear:{session_id}:{student_id}")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data=f"gr_sess:{session_id}")],
+    ]
+    await panel.show(
+        callback, state,
+        f"Студент: {target.full_name}\nВыберите оценку за эту пару:",
+        InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("gr_set:"))
+async def cb_grades_set(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+
+    _, session_id_s, student_id_s, grade = callback.data.split(":")
+    session_id, student_id = int(session_id_s), int(student_id_s)
+
+    await db.set_grade(session_id, student_id, grade)
+    target = await db.get_student_by_id(student_id)
+
+    await panel.show(
+        callback, state,
+        f"✅ Оценка студента «{target.full_name}» установлена: {grade}",
+        back_to_menu_kb(),
+        toast="Оценка обновлена",
+    )
+
+
+@router.callback_query(F.data.startswith("gr_clear:"))
+async def cb_grades_clear(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+
+    _, session_id_s, student_id_s = callback.data.split(":")
+    session_id, student_id = int(session_id_s), int(student_id_s)
+
+    await db.delete_grade(session_id, student_id)
+    target = await db.get_student_by_id(student_id)
+
+    await panel.show(
+        callback, state,
+        f"✅ Оценка студента «{target.full_name}» за эту пару удалена",
+        back_to_menu_kb(),
+        toast="Оценка удалена",
+    )
+
+
+@router.callback_query(F.data.startswith("gr_custom:"))
+async def cb_grades_custom(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+
+    _, session_id_s, student_id_s = callback.data.split(":")
+    session_id, student_id = int(session_id_s), int(student_id_s)
+    await state.update_data(gr_session_id=session_id, gr_student_id=student_id)
+    await state.set_state(GradeStates.waiting_custom_grade)
+    await panel.show(
+        callback, state, "Отправьте значение оценки одним сообщением (например, «зачёт» или «4+»):",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅ Назад", callback_data=f"gr_student:{session_id}:{student_id}")]
+        ]),
+    )
+
+
+@router.message(GradeStates.waiting_custom_grade)
+async def msg_grades_custom(message: Message, db: Database, state: FSMContext) -> None:
+    if await _require_staff(message, db) is None:
+        return
+
+    data = await state.get_data()
+    session_id, student_id = data.get("gr_session_id"), data.get("gr_student_id")
+    if session_id is None or student_id is None:
+        await panel.show(message, state, "Сессия устарела, начните заново.", back_to_menu_kb())
+        await state.clear()
+        return
+
+    grade = (message.text or "").strip()
+    if not grade:
+        await panel.show(message, state, "Пустое значение не подходит, отправьте оценку текстом.")
+        return
+
+    await db.set_grade(session_id, student_id, grade)
+    target = await db.get_student_by_id(student_id)
+    await panel.clear_keep_panel(state)
+    await panel.show(
+        message, state,
+        f"✅ Оценка студента «{target.full_name}» установлена: {grade}",
+        back_to_menu_kb(),
+        toast="Оценка обновлена",
+    )
+
+
+# ----------------------------------------------------------------------
+# Excluded days — a whole date (holiday, cancelled day) removed from
+# attendance tracking: no sessions get created for it going forward, and
+# any that already exist (with their attendance/grades) are deleted.
+# ----------------------------------------------------------------------
+class ExcludeDayStates(StatesGroup):
+    waiting_date = State()
+    waiting_reason = State()
+
+
+def _parse_excluded_date(text: str) -> dt.date | None:
+    text = text.strip()
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+async def _exclude_day_list_view(db: Database) -> tuple[str, InlineKeyboardMarkup]:
+    excluded = await db.get_excluded_dates()
+    lines = ["🚫 <b>Исключённые дни</b>", "Занятия за эти даты не создаются и не учитываются.", ""]
+    buttons: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="➕ Исключить дату", callback_data="excl_add")]
+    ]
+    if not excluded:
+        lines.append("Пока ничего не исключено.")
+    else:
+        for row in excluded:
+            date_obj = dt.date.fromisoformat(row["date"])
+            label = fmt_date_human(date_obj)
+            if row["reason"]:
+                label += f" — {row['reason']}"
+            lines.append(f"• {label}")
+            buttons.append([InlineKeyboardButton(
+                text=f"↩️ Вернуть {date_obj.strftime('%d.%m.%Y')}",
+                callback_data=f"excl_remove:{row['date']}",
+            )])
+    return "\n".join(lines), with_back_to_menu(buttons)
+
+
+@router.message(Command("exclude_day"))
+async def cmd_exclude_day(message: Message, db: Database, state: FSMContext) -> None:
+    if await _require_staff(message, db) is None:
+        return
+    text, keyboard = await _exclude_day_list_view(db)
+    await panel.show(message, state, text, keyboard)
+
+
+@router.callback_query(F.data == "menu:exclude_day")
+async def cb_menu_exclude_day(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    text, keyboard = await _exclude_day_list_view(db)
+    await panel.show(callback, state, text, keyboard)
+
+
+@router.callback_query(F.data == "excl_back")
+async def cb_exclude_day_back(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    text, keyboard = await _exclude_day_list_view(db)
+    await panel.show(callback, state, text, keyboard)
+
+
+@router.callback_query(F.data == "excl_add")
+async def cb_exclude_day_add(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    await state.set_state(ExcludeDayStates.waiting_date)
+    await panel.show(
+        callback, state,
+        "Введите дату, которую нужно исключить, в формате ДД.ММ.ГГГГ (например, 08.03.2027):",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Отмена", callback_data="excl_back")]]),
+    )
+
+
+@router.message(ExcludeDayStates.waiting_date)
+async def msg_exclude_day_date(message: Message, db: Database, state: FSMContext) -> None:
+    if await _require_staff(message, db) is None:
+        return
+
+    date_obj = _parse_excluded_date(message.text or "")
+    if date_obj is None:
+        await panel.show(
+            message, state,
+            "Не могу разобрать дату. Введите в формате ДД.ММ.ГГГГ, например 08.03.2027:",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Отмена", callback_data="excl_back")]]),
+        )
+        return
+
+    await state.update_data(excl_date=date_obj.isoformat())
+    await state.set_state(ExcludeDayStates.waiting_reason)
+    await panel.show(
+        message, state,
+        f"Дата: {fmt_date_human(date_obj)}\nУкажите причину одним сообщением (например, «Праздник») "
+        "или отправьте «-», чтобы оставить без причины:",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Отмена", callback_data="excl_back")]]),
+    )
+
+
+@router.message(ExcludeDayStates.waiting_reason)
+async def msg_exclude_day_reason(message: Message, db: Database, state: FSMContext) -> None:
+    if await _require_staff(message, db) is None:
+        return
+
+    data = await state.get_data()
+    date_iso = data.get("excl_date")
+    if date_iso is None:
+        await panel.show(message, state, "Сессия устарела, начните заново.", back_to_menu_kb())
+        await state.clear()
+        return
+
+    reason = (message.text or "").strip()
+    reason = None if reason in ("", "-") else reason
+
+    await db.add_excluded_date(date_iso, reason)
+    removed = await db.delete_sessions_for_date(date_iso)
+    await panel.clear_keep_panel(state)
+
+    date_obj = dt.date.fromisoformat(date_iso)
+    text = f"✅ {fmt_date_human(date_obj)} исключён из учёта."
+    if removed:
+        text += f"\nУдалено занятий за этот день (с посещаемостью и оценками): {removed}."
+    await panel.show(message, state, text, back_to_menu_kb(), toast="День исключён")
+
+
+@router.callback_query(F.data.startswith("excl_remove:"))
+async def cb_exclude_day_remove(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    if await _require_staff_cb(callback, db) is None:
+        return
+    date_iso = callback.data.split(":", 1)[1]
+    await db.remove_excluded_date(date_iso)
+    text, keyboard = await _exclude_day_list_view(db)
+    await panel.show(callback, state, text, keyboard, toast="Исключение снято")
+
+
+# ----------------------------------------------------------------------
 # /report — Excel export (build_excel_report lives in reports.py, shared
 # with the automatic weekly report in scheduler.py)
 # ----------------------------------------------------------------------

@@ -69,6 +69,16 @@ CREATE TABLE IF NOT EXISTS attendance (
     UNIQUE(session_id, student_id)
 );
 
+-- A specific calendar date (e.g. a public holiday, a cancelled day)
+-- removed from attendance tracking entirely: no sessions get created for
+-- it, and any that already existed are deleted. Distinct from
+-- planned_absences, which excuses one student rather than the whole day.
+CREATE TABLE IF NOT EXISTS excluded_dates (
+    date TEXT PRIMARY KEY,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -101,9 +111,20 @@ CREATE TABLE IF NOT EXISTS planned_absence_pairs (
     UNIQUE(student_id, date, pair_number)
 );
 
+CREATE TABLE IF NOT EXISTS grades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    grade TEXT NOT NULL,
+    marked_at TEXT NOT NULL,
+    UNIQUE(session_id, student_id)
+);
+
 -- Homework shared by anyone in the group, browsable by subject. Files are
 -- stored by MAX's upload token only (see MaxClient.send_document /
 -- send_file_by_token) — the binary itself lives on MAX's servers.
+-- file_type is whatever attachment type MAX tagged the upload with (file,
+-- image, video, audio, ...) so it can be re-sent as the same kind later.
 CREATE TABLE IF NOT EXISTS homework (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -111,6 +132,7 @@ CREATE TABLE IF NOT EXISTS homework (
     description TEXT,
     file_token TEXT NOT NULL,
     file_name TEXT NOT NULL,
+    file_type TEXT NOT NULL DEFAULT 'file',
     uploaded_at TEXT NOT NULL
 );
 
@@ -218,6 +240,11 @@ class Database:
             session_cols = {row[1] for row in await cur.fetchall()}
             if "reminded" not in session_cols:
                 await db.execute("ALTER TABLE sessions ADD COLUMN reminded INTEGER NOT NULL DEFAULT 0")
+                await db.commit()
+            cur = await db.execute("PRAGMA table_info(homework)")
+            homework_cols = {row[1] for row in await cur.fetchall()}
+            if "file_type" not in homework_cols:
+                await db.execute("ALTER TABLE homework ADD COLUMN file_type TEXT NOT NULL DEFAULT 'file'")
                 await db.commit()
         await self._seed_roster()
         await self._ensure_invite_tokens()
@@ -500,6 +527,54 @@ class Database:
             return await cur.fetchall()
 
     # ------------------------------------------------------------------
+    # Excluded dates — a whole day removed from attendance tracking (see
+    # `excluded_dates` above). Deleting sessions here cleans up dependent
+    # attendance/grades/notifications rows explicitly rather than relying
+    # on ON DELETE CASCADE, which SQLite only honors when a connection has
+    # run `PRAGMA foreign_keys = ON` — not guaranteed on every short-lived
+    # connection this class opens.
+    # ------------------------------------------------------------------
+    async def add_excluded_date(self, date: str, reason: str | None) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO excluded_dates (date, reason, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(date) DO UPDATE SET reason = excluded.reason",
+                (date, reason, dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            await db.commit()
+
+    async def remove_excluded_date(self, date: str) -> None:
+        async with self._connect() as db:
+            await db.execute("DELETE FROM excluded_dates WHERE date = ?", (date,))
+            await db.commit()
+
+    async def get_excluded_dates(self) -> list[aiosqlite.Row]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM excluded_dates ORDER BY date DESC")
+            return await cur.fetchall()
+
+    async def is_date_excluded(self, date: str) -> bool:
+        async with self._connect() as db:
+            cur = await db.execute("SELECT 1 FROM excluded_dates WHERE date = ?", (date,))
+            return await cur.fetchone() is not None
+
+    async def delete_sessions_for_date(self, date: str) -> int:
+        """Removes every session on `date`, plus its attendance, grades
+        and check-in notifications. Returns how many sessions were removed."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT id FROM sessions WHERE date = ?", (date,))
+            session_ids = [row["id"] for row in await cur.fetchall()]
+            for session_id in session_ids:
+                await db.execute("DELETE FROM attendance WHERE session_id = ?", (session_id,))
+                await db.execute("DELETE FROM grades WHERE session_id = ?", (session_id,))
+                await db.execute("DELETE FROM notifications WHERE session_id = ?", (session_id,))
+            await db.execute("DELETE FROM sessions WHERE date = ?", (date,))
+            await db.commit()
+            return len(session_ids)
+
+    # ------------------------------------------------------------------
     # Notifications (sent check-in messages, needed to edit them later)
     # ------------------------------------------------------------------
     async def add_notification(self, session_id: int, student_id: int, user_id: int,
@@ -608,6 +683,59 @@ class Database:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT * FROM sessions WHERE date BETWEEN ? AND ? ORDER BY date, pair_number",
+                (date_from, date_to),
+            )
+            return await cur.fetchall()
+
+    # ------------------------------------------------------------------
+    # Grades — one per (session, student), set by staff via the "Оценки" menu
+    # ------------------------------------------------------------------
+    async def set_grade(self, session_id: int, student_id: int, grade: str) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO grades (session_id, student_id, grade, marked_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id, student_id) DO UPDATE SET grade = excluded.grade, "
+                "marked_at = excluded.marked_at",
+                (session_id, student_id, grade, dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            await db.commit()
+
+    async def delete_grade(self, session_id: int, student_id: int) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM grades WHERE session_id = ? AND student_id = ?", (session_id, student_id)
+            )
+            await db.commit()
+
+    async def get_grade(self, session_id: int, student_id: int) -> aiosqlite.Row | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM grades WHERE session_id = ? AND student_id = ?",
+                (session_id, student_id),
+            )
+            return await cur.fetchone()
+
+    async def get_grades_for_session(self, session_id: int) -> list[aiosqlite.Row]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT g.*, s.full_name FROM grades g "
+                "JOIN students s ON s.id = g.student_id WHERE g.session_id = ?",
+                (session_id,),
+            )
+            return await cur.fetchall()
+
+    async def get_grades_range(self, date_from: str, date_to: str) -> list[aiosqlite.Row]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT sess.date, sess.pair_number, st.id AS student_id, g.grade "
+                "FROM sessions sess "
+                "JOIN grades g ON g.session_id = sess.id "
+                "JOIN students st ON st.id = g.student_id "
+                "WHERE sess.date BETWEEN ? AND ?",
                 (date_from, date_to),
             )
             return await cur.fetchall()
@@ -800,12 +928,12 @@ class Database:
     # Homework — uploaded by anyone, browsable by subject
     # ------------------------------------------------------------------
     async def add_homework(self, student_id: int, subject: str, description: str | None,
-                            file_token: str, file_name: str) -> int:
+                            file_token: str, file_name: str, file_type: str = "file") -> int:
         async with self._connect() as db:
             cur = await db.execute(
-                "INSERT INTO homework (student_id, subject, description, file_token, file_name, uploaded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (student_id, subject, description, file_token, file_name,
+                "INSERT INTO homework (student_id, subject, description, file_token, file_name, "
+                "file_type, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (student_id, subject, description, file_token, file_name, file_type,
                  dt.datetime.now().isoformat(timespec="seconds")),
             )
             await db.commit()
