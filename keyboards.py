@@ -46,6 +46,7 @@ def employee_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📆 Отчёт за неделю", callback_data="emp:week")],
         [InlineKeyboardButton(text="🈷 Отчёт за месяц", callback_data="emp:month")],
         [InlineKeyboardButton(text="📚 Отчёт за всё время", callback_data="emp:all")],
+        [InlineKeyboardButton(text="🏷 Оценки", callback_data="menu:grades")],
     ])
 
 

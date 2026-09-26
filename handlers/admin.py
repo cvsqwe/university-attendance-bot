@@ -16,7 +16,12 @@ from magic_filter import F
 
 import config
 import panel
-from access import require_staff as _require_staff, require_staff_cb as _require_staff_cb
+from access import (
+    require_employee as _require_employee,
+    require_employee_cb as _require_employee_cb,
+    require_staff as _require_staff,
+    require_staff_cb as _require_staff_cb,
+)
 from database import Database
 from keyboards import back_to_menu_kb, with_back_to_menu
 from maxapi.client import MaxClient
@@ -476,7 +481,7 @@ async def _grades_session_list(db: Database) -> tuple[str, InlineKeyboardMarkup]
 
 @router.message(Command("grades"))
 async def cmd_grades(message: Message, db: Database, state: FSMContext) -> None:
-    if await _require_staff(message, db) is None:
+    if await _require_employee(message, db) is None:
         return
     text, keyboard = await _grades_session_list(db)
     await panel.show(message, state, text, keyboard)
@@ -484,7 +489,7 @@ async def cmd_grades(message: Message, db: Database, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "menu:grades")
 async def cb_menu_grades(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
-    if await _require_staff_cb(callback, db) is None:
+    if await _require_employee_cb(callback, db) is None:
         return
     text, keyboard = await _grades_session_list(db)
     await panel.show(callback, state, text, keyboard)
@@ -492,7 +497,7 @@ async def cb_menu_grades(callback: CallbackQuery, db: Database, state: FSMContex
 
 @router.callback_query(F.data == "gr_back")
 async def cb_grades_back(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
-    if await _require_staff_cb(callback, db) is None:
+    if await _require_employee_cb(callback, db) is None:
         return
     text, keyboard = await _grades_session_list(db)
     await panel.show(callback, state, text, keyboard)
@@ -500,7 +505,7 @@ async def cb_grades_back(callback: CallbackQuery, db: Database, state: FSMContex
 
 @router.callback_query(F.data.startswith("gr_sess:"))
 async def cb_grades_session(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
-    if await _require_staff_cb(callback, db) is None:
+    if await _require_employee_cb(callback, db) is None:
         return
 
     session_id = int(callback.data.split(":", 1)[1])
@@ -530,7 +535,7 @@ async def cb_grades_session(callback: CallbackQuery, db: Database, state: FSMCon
 
 @router.callback_query(F.data.startswith("gr_student:"))
 async def cb_grades_student(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
-    if await _require_staff_cb(callback, db) is None:
+    if await _require_employee_cb(callback, db) is None:
         return
 
     _, session_id_s, student_id_s = callback.data.split(":")
@@ -555,7 +560,7 @@ async def cb_grades_student(callback: CallbackQuery, db: Database, state: FSMCon
 
 @router.callback_query(F.data.startswith("gr_set:"))
 async def cb_grades_set(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
-    if await _require_staff_cb(callback, db) is None:
+    if await _require_employee_cb(callback, db) is None:
         return
 
     _, session_id_s, student_id_s, grade = callback.data.split(":")
@@ -574,7 +579,7 @@ async def cb_grades_set(callback: CallbackQuery, db: Database, state: FSMContext
 
 @router.callback_query(F.data.startswith("gr_clear:"))
 async def cb_grades_clear(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
-    if await _require_staff_cb(callback, db) is None:
+    if await _require_employee_cb(callback, db) is None:
         return
 
     _, session_id_s, student_id_s = callback.data.split(":")
@@ -593,7 +598,7 @@ async def cb_grades_clear(callback: CallbackQuery, db: Database, state: FSMConte
 
 @router.callback_query(F.data.startswith("gr_custom:"))
 async def cb_grades_custom(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
-    if await _require_staff_cb(callback, db) is None:
+    if await _require_employee_cb(callback, db) is None:
         return
 
     _, session_id_s, student_id_s = callback.data.split(":")
@@ -610,7 +615,7 @@ async def cb_grades_custom(callback: CallbackQuery, db: Database, state: FSMCont
 
 @router.message(GradeStates.waiting_custom_grade)
 async def msg_grades_custom(message: Message, db: Database, state: FSMContext) -> None:
-    if await _require_staff(message, db) is None:
+    if await _require_employee(message, db) is None:
         return
 
     data = await state.get_data()
